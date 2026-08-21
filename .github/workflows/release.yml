@@ -1,0 +1,383 @@
+name: Build & Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to attach binaries to (e.g. v0.1.0)"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+# Standard asset names must match Lemonade's media_release_asset():
+#   trellis-<backend>-<os>-x64.<tar.gz|zip>
+# cuda12 is an additional legacy artifact selected by the standalone installer
+# for Pascal/Volta devices; it does not replace Lemonade's current-CUDA asset.
+jobs:
+  build:
+    name: ${{ matrix.os }} · ${{ matrix.release_backend || matrix.backend }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux,   backend: vulkan, runner: ubuntu-22.04 }
+          - { os: linux,   backend: cuda,   release_backend: cuda,   cuda_version: "13.1.0", cuda_archs: "75;80;86;89;90;120", runner: ubuntu-22.04 }
+          - { os: linux,   backend: cuda,   release_backend: cuda12, cuda_version: "12.9.1", cuda_archs: "60;61;70",          runner: ubuntu-22.04 }
+          - { os: linux,   backend: rocm,   runner: ubuntu-22.04,  experimental: true }
+          - { os: windows, backend: vulkan, runner: windows-2022 }
+          - { os: windows, backend: cuda,   release_backend: cuda,   cuda_version: "13.1.0", cuda_archs: "75;80;86;89;90;120", runner: windows-2022, experimental: true }
+          - { os: windows, backend: cuda,   release_backend: cuda12, cuda_version: "12.9.1", cuda_archs: "60;61;70",          runner: windows-2022, experimental: true }
+          - { os: windows, backend: rocm,   runner: windows-2022, experimental: true }
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: MSVC dev shell (Windows)
+        if: matrix.os == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.os }}-${{ matrix.release_backend || matrix.backend }}
+
+      # GitHub's Ubuntu runners prefer azure.archive.ubuntu.com through
+      # /etc/apt/apt-mirrors.txt. A dead Azure mirror can otherwise leave apt
+      # (including the CUDA toolkit action's internal apt-get update) hung until
+      # the six-hour job limit. Use Ubuntu's HTTPS archive and bound retries.
+      - name: Harden Ubuntu package downloads
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu' |
+              sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          for sources in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+            if [ -f "$sources" ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$sources"
+            fi
+          done
+          sudo tee /etc/apt/apt.conf.d/99-trellis-network >/dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "30";
+          Acquire::https::Timeout "30";
+          EOF
+
+      # Linux: the minimal SDK is enough (runner provides spirv-headers).
+      - name: Vulkan SDK (Linux)
+        if: matrix.backend == 'vulkan' && matrix.os == 'linux'
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+      # Windows: ggml-vulkan + the deform_conv shader need the full SDK
+      # (SPIRV-Headers/-Tools CMake configs), which the minimal install lacks.
+      - name: Vulkan SDK (Windows)
+        if: matrix.backend == 'vulkan' && matrix.os == 'windows'
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          vulkan_version: 1.4.309.0
+          install_runtime: true
+          cache: true
+      - name: SPIRV-Headers (Windows Vulkan)
+        if: matrix.backend == 'vulkan' && matrix.os == 'windows'
+        shell: bash
+        run: |
+          set -e
+          git clone --depth 1 --branch vulkan-sdk-1.4.309.0 https://github.com/KhronosGroup/SPIRV-Headers \
+            || git clone --depth 1 https://github.com/KhronosGroup/SPIRV-Headers
+          cmake -S SPIRV-Headers -B SPIRV-Headers/build -DCMAKE_INSTALL_PREFIX="$PWD/spirv-headers-install"
+          cmake --build SPIRV-Headers/build --target install --config Release
+          echo "SPIRV_HEADERS_ROOT=$(cygpath -m "$PWD/spirv-headers-install")" >> "$GITHUB_ENV"
+
+      - name: CUDA toolkit
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.30
+        timeout-minutes: 60
+        with:
+          cuda: ${{ matrix.cuda_version }}
+          method: network
+
+      # Best-effort ROCm 7.12 (TheRock), matching the version Lemonade pins.
+      # Marked experimental: this leg is allowed to fail.
+      # ROCm via TheRock (gfx1151, Strix Halo — Lemonade's validated target).
+      # Best-effort: allow-failure (no AMD GPU in CI to run-test).
+      - name: ROCm TheRock (Linux, gfx1151)
+        if: matrix.backend == 'rocm' && matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -e
+          base="https://rocm.nightlies.amd.com/tarball-multi-arch"
+          prefix="therock-dist-linux-gfx1151-"
+          files=$(curl -s "$base/" | tr '\n' ' ' | grep -oP 'const files = \K\[.*?\](?=\s*;)')
+          latest=$(echo "$files" | jq -r --arg p "$prefix" \
+            '[.[]|select(.name|startswith($p))|select(.name|test("[0-9]{8}\\.tar\\.gz$"))]|sort_by(.name|capture("(?<d>[0-9]{8})\\.tar\\.gz$").d)|last|.name // empty')
+          test -n "$latest"
+          echo "TheRock tarball: $latest"
+          sudo mkdir -p /opt/rocm
+          curl -sL "$base/$latest" | sudo tar --use-compress-program=gzip -xf - -C /opt/rocm --strip-components=1
+          {
+            echo "ROCM_PATH=/opt/rocm"
+            echo "HIP_PATH=/opt/rocm"
+            echo "HIP_PLATFORM=amd"
+            echo "LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/llvm/lib"
+            echo "ROCM_CC=/opt/rocm/llvm/bin/clang"
+            echo "ROCM_CXX=/opt/rocm/llvm/bin/clang++"
+          } >> "$GITHUB_ENV"
+          echo "/opt/rocm/bin:/opt/rocm/llvm/bin" >> "$GITHUB_PATH"
+
+      - name: ROCm TheRock (Windows, gfx1151)
+        if: matrix.backend == 'rocm' && matrix.os == 'windows'
+        shell: bash
+        run: |
+          set -e
+          base="https://rocm.nightlies.amd.com/tarball-multi-arch"
+          prefix="therock-dist-windows-gfx1151-"
+          files=$(curl -s "$base/" | tr '\n' ' ' | grep -oP 'const files = \K\[.*?\](?=\s*;)')
+          latest=$(echo "$files" | jq -r --arg p "$prefix" \
+            '[.[]|select(.name|startswith($p))|select(.name|test("[0-9]{8}\\.tar\\.gz$"))]|sort_by(.name|capture("(?<d>[0-9]{8})\\.tar\\.gz$").d)|last|.name // empty')
+          test -n "$latest"
+          echo "TheRock tarball: $latest"
+          mkdir -p rocm
+          curl -sL "$base/$latest" | tar -xzf - -C rocm --strip-components=1
+          HIP=$(cygpath -m "$PWD/rocm")
+          {
+            echo "HIP_PATH=$HIP"
+            echo "HIP_PLATFORM=amd"
+            echo "ROCM_CC=$HIP/lib/llvm/bin/clang.exe"
+            echo "ROCM_CXX=$HIP/lib/llvm/bin/clang++.exe"
+          } >> "$GITHUB_ENV"
+          echo "$PWD/rocm/bin" >> "$GITHUB_PATH"
+          echo "$PWD/rocm/lib/llvm/bin" >> "$GITHUB_PATH"
+
+      - name: Configure & build
+        shell: bash
+        run: |
+          set -e
+          case "${{ matrix.backend }}" in
+            vulkan) FLAGS="-DGGML_VULKAN=ON" ;;
+            # ggml rewrites 12x -> 12xa (arch-specific); Blackwell ships SASS-only
+            # (120a can't be virtual), so no PTX fallback entry here.
+            cuda)   FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.cuda_archs }}" ;;
+            # Popular consumer ISAs: RDNA2 dGPUs, RDNA3 dGPUs + 780M, RDNA3.5 iGPUs, RDNA4.
+            rocm)   FLAGS="-DGGML_HIP=ON -DGGML_HIP_GRAPHS=OFF -DGPU_TARGETS=gfx1030;gfx1031;gfx1032;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1152;gfx1200;gfx1201 -DCMAKE_C_COMPILER=$ROCM_CC -DCMAKE_CXX_COMPILER=$ROCM_CXX -DCMAKE_PREFIX_PATH=$HIP_PATH -DCMAKE_HIP_COMPILER=$ROCM_CXX" ;;
+          esac
+          # Windows builds only: TheRock's Windows ROCm dist ships a minimal
+          # Clang toolchain (enough to compile HIP kernels) but not the LLVM
+          # OpenMP runtime, so a ggml-cpu linked against OpenMP fails to start
+          # (missing libomp140.x86_64.dll). ggml has its own portable thread
+          # pool for exactly this case; use it instead of chasing the DLL.
+          # (trellis.cpp's own deform_conv_cpu.cpp no longer uses OpenMP
+          # either -- see CMakeLists.txt / src/deform_conv_cpu.cpp.)
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            FLAGS="$FLAGS -DGGML_OPENMP=OFF"
+          fi
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release $FLAGS ${SPIRV_HEADERS_ROOT:+-DCMAKE_PREFIX_PATH=$SPIRV_HEADERS_ROOT}
+          # Ship both the resident HTTP server and the one-shot CLI (issue #15).
+          cmake --build build --target trellis-server trellis-cli -j
+
+      - name: Package
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cp build/trellis-server.exe dist/
+            cp build/trellis-cli.exe dist/
+            cp build/*.dll dist/ 2>/dev/null || true
+            if [ "${{ matrix.backend }}" = "cuda" ]; then
+              # $CUDA_PATH is a Windows path (backslashes/spaces) that breaks bash
+              # globbing. CUDA 13 also relocated the Windows runtime DLLs out of
+              # bin/ (into bin/x64), so locate each wherever it lives under the
+              # toolkit and fail loudly (set -e) rather than shipping a zip with
+              # no CUDA runtime.
+              cuda_root="$(cygpath -u "$CUDA_PATH")"
+              echo "== CUDA runtime DLLs found under $cuda_root =="
+              find "$cuda_root" -type f \( -name 'cudart64_*.dll' -o -name 'cublas64_*.dll' -o -name 'cublasLt64_*.dll' \) -print
+              for dll in cudart64 cublas64 cublasLt64; do
+                src="$(find "$cuda_root" -type f -name "${dll}_*.dll" -print -quit)"
+                if [ -z "$src" ]; then echo "ERROR: ${dll}_*.dll not found under CUDA toolkit"; exit 1; fi
+                cp "$src" dist/
+              done
+              ls -la dist/*.dll
+            fi
+            ASSET="trellis-${{ matrix.release_backend || matrix.backend }}-windows-x64.zip"
+            (cd dist && 7z a -y "../$ASSET" ./* >/dev/null)
+          else
+            cp build/trellis-server dist/
+            cp build/trellis-cli dist/
+            cp -P build/libggml*.so* dist/ 2>/dev/null || true
+            # The ROCm runtime comes from the shared TheRock SDK that Lemonade
+            # installs per the user's gfx arch (via LD_LIBRARY_PATH), not bundled
+            # here. CUDA has no such shared SDK, so bundle its runtime next to the
+            # binary (mirrors sd-cpp / llama.cpp); the $ORIGIN rpath below then
+            # resolves it with no system CUDA toolkit required.
+            if [ "${{ matrix.backend }}" = "cuda" ]; then
+              cuda_lib="${CUDA_PATH:-/usr/local/cuda}/lib64"
+              for l in libcudart libcublas libcublasLt; do
+                cp -P "$cuda_lib"/$l.so* dist/ 2>/dev/null || true
+              done
+            fi
+            sudo apt-get install -y -qq patchelf
+            for f in $(find dist -type f); do patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true; done
+            ASSET="trellis-${{ matrix.release_backend || matrix.backend }}-linux-x64.tar.gz"
+            tar -C dist -czf "$ASSET" .
+          fi
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "value=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release upload "${{ steps.tag.outputs.value }}" "$ASSET" --clobber --repo "${{ github.repository }}"
+
+  # Trellis Studio desktop app (Tauri). Small, backend-agnostic installers that
+  # the install/ scripts fetch by these stable, version-less names:
+  #   trellis-studio-linux-x86_64.AppImage / trellis-studio-linux-amd64.deb
+  #   trellis-studio-windows-x64.msi
+  studio:
+    name: ${{ matrix.os }} · Trellis Studio app
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux,   runner: ubuntu-22.04 }
+          - { os: windows, runner: windows-2022 }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+
+      # Keep the runner's Azure Ubuntu mirror from hanging apt-get update until
+      # GitHub's six-hour job timeout. See the equivalent runtime-build step.
+      - name: Harden Ubuntu package downloads
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu' |
+              sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          fi
+          for sources in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+            if [ -f "$sources" ]; then
+              sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$sources"
+            fi
+          done
+          sudo tee /etc/apt/apt.conf.d/99-trellis-network >/dev/null <<'EOF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "30";
+          Acquire::https::Timeout "30";
+          EOF
+
+      # Tauri v2 Linux system dependencies (webkit2gtk 4.1 stack).
+      - name: Linux system deps
+        if: matrix.os == 'linux'
+        timeout-minutes: 30
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev libgtk-3-dev librsvg2-dev patchelf libappindicator3-dev file
+
+      - name: Build Trellis Studio
+        working-directory: app
+        run: |
+          npm ci
+          npm run tauri build
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "value=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package & upload (Linux)
+        if: matrix.os == 'linux'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -e
+          base=app/src-tauri/target/release/bundle
+          appimage=$(find "$base/appimage" -name '*.AppImage' | head -1)
+          deb=$(find "$base/deb" -name '*.deb' | head -1)
+          cp "$appimage" trellis-studio-linux-x86_64.AppImage
+          cp "$deb" trellis-studio-linux-amd64.deb
+          # Portable, no-install tarball: the raw binary + a portable.dat marker
+          # (which makes the app keep config/data next to itself). Relies on the
+          # system webkit2gtk-4.1, like the .deb.
+          rm -rf portable && mkdir -p portable
+          cp app/src-tauri/target/release/trellis-studio portable/
+          cp install/portable-readme.txt portable/README.txt
+          : > portable/portable.dat
+          tar -C portable -czf trellis-studio-linux-x86_64-portable.tar.gz .
+          gh release upload "${{ steps.tag.outputs.value }}" \
+            trellis-studio-linux-x86_64.AppImage trellis-studio-linux-amd64.deb \
+            trellis-studio-linux-x86_64-portable.tar.gz \
+            --clobber --repo "${{ github.repository }}"
+
+      - name: Package & upload (Windows)
+        if: matrix.os == 'windows'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -e
+          base=app/src-tauri/target/release/bundle
+          # tauri.conf.json builds an NSIS installer (per-user, silent-installable)
+          exe=$(find "$base/nsis" -name '*-setup.exe' | head -1)
+          test -n "$exe" || { echo "NSIS installer not found under $base/nsis"; ls -R "$base" || true; exit 1; }
+          cp "$exe" trellis-studio-windows-x64-setup.exe
+          # Portable, no-install zip: the raw exe + a portable.dat marker (which
+          # makes the app keep config/data next to itself). WebView2 runtime is a
+          # system component, present on Win10/11.
+          rm -rf portable && mkdir -p portable
+          cp app/src-tauri/target/release/trellis-studio.exe portable/
+          cp app/src-tauri/target/release/*.dll portable/ 2>/dev/null || true
+          cp install/portable-readme.txt portable/README.txt
+          : > portable/portable.dat
+          (cd portable && 7z a -y ../trellis-studio-windows-x64-portable.zip ./* >/dev/null)
+          gh release upload "${{ steps.tag.outputs.value }}" \
+            trellis-studio-windows-x64-setup.exe trellis-studio-windows-x64-portable.zip \
+            --clobber --repo "${{ github.repository }}"
