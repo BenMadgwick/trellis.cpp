@@ -17,9 +17,17 @@ public:
         float point[3] = {0, 0, 0};
     };
 
+    // First surface a ray meets. Used to decide which sheet of the narrow-band
+    // shell is the one you can actually see (see strip_interior.h).
+    struct RayHit {
+        float t = 1e30f;      // distance along dir, which need not be normalised
+        int32_t face = -1;
+    };
+
     static TriBvh build(const float* verts, int64_t V, const int32_t* faces, int64_t F);
 
     Hit closest(const float p[3], float max_dist = 1e30f) const;
+    RayHit ray(const float org[3], const float dir[3], float max_t = 1e30f) const;
     bool empty() const { return nodes_.empty(); }
 
 private:

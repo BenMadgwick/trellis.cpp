@@ -8,6 +8,7 @@
 #include "uv_bake.h"
 #include "tri_bvh.h"
 #include "remesh_dc.h"
+#include "strip_interior.h"
 #include "mesh_glb.h"
 #include <chrono>
 #include <cstdio>
@@ -42,7 +43,10 @@ int main(int argc, char** argv) {
     const char* out = argv[2];
     bool boxuv = false, do_weld = true, do_fill = true, do_bake = true, do_remesh = true, do_snap = true;
     int band = 1;
+    bool do_strip = false;
+    trellis::StripOpts strip;
     int faces_target = 300000, atlas = 2048, decim = -1;
+    const char* save_mesh = nullptr; const char* load_mesh = nullptr;
     for (int i = 3; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--box-uv") boxuv = true;
@@ -55,20 +59,37 @@ int main(int argc, char** argv) {
         else if (a == "--no-remesh") do_remesh = false;
         else if (a == "--band" && i+1 < argc) band = atoi(argv[++i]);
         else if (a == "--no-snap") do_snap = false;
+        else if (a == "--strip-interior") do_strip = true;
+        else if (a == "--strip-grid" && i+1 < argc) strip.grid = atoi(argv[++i]);
+        else if (a == "--strip-depth" && i+1 < argc) strip.depth = atoi(argv[++i]);
+        else if (a == "--strip-seal" && i+1 < argc) strip.seal = atoi(argv[++i]);
+        else if (a == "--save-mesh" && i+1 < argc) save_mesh = argv[++i];
+        else if (a == "--load-mesh" && i+1 < argc) load_mesh = argv[++i];
     }
 
     FILE* f = fopen(dump, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", dump); return 1; }
-    int V, F, Mv, res;
-    if (fread(&V,4,1,f)+fread(&F,4,1,f)+fread(&Mv,4,1,f)+fread(&res,4,1,f) != 4) return 1;
+    int V = 0, F = 0, Mv = 0, res = 0;
+    // Read the four header fields as separate statements. Summing four fread
+    // calls in one expression leaves them unsequenced, so a compiler is free to
+    // run them right-to-left (MSVC does) and the fields land in the wrong
+    // variables - the sum is still 4, so the check passes and the next read
+    // asks for the wrong byte count.
+    const bool hdr = fread(&V,4,1,f) == 1 && fread(&F,4,1,f) == 1
+                  && fread(&Mv,4,1,f) == 1 && fread(&res,4,1,f) == 1;
+    if (!hdr) { fprintf(stderr, "%s: truncated header\n", dump); fclose(f); return 1; }
+    if (V <= 0 || F <= 0 || Mv < 0 || res <= 0) {
+        fprintf(stderr, "%s: implausible header V=%d F=%d voxels=%d res=%d\n", dump, V, F, Mv, res);
+        fclose(f); return 1;
+    }
     std::vector<float> verts((size_t)V*3);
     std::vector<int32_t> faces((size_t)F*3);
     std::vector<std::array<int,3>> coords((size_t)Mv);
     std::vector<float> pbr6((size_t)Mv*6);
-    if (fread(verts.data(),4,verts.size(),f) != verts.size()) return 1;
-    if (fread(faces.data(),4,faces.size(),f) != faces.size()) return 1;
-    for (auto& c : coords) if (fread(c.data(),4,3,f) != 3) return 1;
-    if (fread(pbr6.data(),4,pbr6.size(),f) != pbr6.size()) return 1;
+    if (fread(verts.data(),4,verts.size(),f) != verts.size()) { fprintf(stderr, "%s: short read (verts)\n", dump); fclose(f); return 1; }
+    if (fread(faces.data(),4,faces.size(),f) != faces.size()) { fprintf(stderr, "%s: short read (faces)\n", dump); fclose(f); return 1; }
+    for (auto& c : coords) if (fread(c.data(),4,3,f) != 3) { fprintf(stderr, "%s: short read (voxel coords)\n", dump); fclose(f); return 1; }
+    if (fread(pbr6.data(),4,pbr6.size(),f) != pbr6.size()) { fprintf(stderr, "%s: short read (pbr)\n", dump); fclose(f); return 1; }
     fclose(f);
     printf("loaded: V=%d F=%d voxels=%d res=%d\n", V, F, Mv, res);
 
@@ -84,7 +105,25 @@ int main(int argc, char** argv) {
                                                  faces.data(), (int64_t)faces.size()/3);
     printf("  [bvh %.1fs]\n", now()-t); t = now();
     trellis::Mesh rm;
-    if (do_remesh) {
+    // Dev aid: cache the post-remesh mesh so the strip can be iterated on
+    // without paying weld+fill+bvh+remesh+clean each time (~4 min).
+    bool cached = false;
+    if (load_mesh) {
+        FILE* mf = fopen(load_mesh, "rb");
+        if (mf) {
+            int mV = 0, mF = 0;
+            if (fread(&mV,4,1,mf) == 1 && fread(&mF,4,1,mf) == 1 && mV > 0 && mF > 0) {
+                rm.verts.resize((size_t)mV*3);
+                rm.faces.resize((size_t)mF*3);
+                cached = fread(rm.verts.data(),4,rm.verts.size(),mf) == rm.verts.size()
+                      && fread(rm.faces.data(),4,rm.faces.size(),mf) == rm.faces.size();
+                if (cached) printf("  [cache] loaded post-remesh V=%d F=%d from %s\n", mV, mF, load_mesh);
+            }
+            fclose(mf);
+            if (!cached) { rm.verts.clear(); rm.faces.clear(); fprintf(stderr, "  [cache] %s unusable, remeshing\n", load_mesh); }
+        }
+    }
+    if (do_remesh && !cached) {
         rm = trellis::remesh_narrow_band_dc(verts.data(), (int64_t)verts.size()/3,
                                             faces.data(), (int64_t)faces.size()/3, bvh, res, band);
         printf("  [remesh %.1fs]\n", now()-t); t = now();
@@ -98,8 +137,31 @@ int main(int argc, char** argv) {
             audit("drop_components", rm.faces);
         }
     }
-    const std::vector<float>& sverts = rm.F() > 0 ? rm.verts : verts;
-    const std::vector<int32_t>& sfaces = rm.F() > 0 ? rm.faces : faces;
+    std::vector<float>& sverts = rm.F() > 0 ? rm.verts : verts;
+    std::vector<int32_t>& sfaces = rm.F() > 0 ? rm.faces : faces;
+
+    if (save_mesh && !cached) {
+        FILE* mf = fopen(save_mesh, "wb");
+        if (mf) {
+            const int mV = (int)(sverts.size()/3), mF = (int)(sfaces.size()/3);
+            fwrite(&mV,4,1,mf); fwrite(&mF,4,1,mf);
+            fwrite(sverts.data(),4,sverts.size(),mf);
+            fwrite(sfaces.data(),4,sfaces.size(),mf);
+            fclose(mf);
+            printf("  [cache] saved post-remesh mesh V=%d F=%d -> %s\n", mV, mF, save_mesh);
+        }
+    }
+
+    // Opt-in divergence from the reference: drop the buried sheets of the
+    // narrow-band shell before simplifying. The offset surface is two-sided by
+    // construction and the input was already two-walled, so most of what QEM is
+    // about to spend its budget on can never be seen - and being crumpled, it
+    // scores as high-curvature detail and outbids the smooth visible skin.
+    if (do_strip) {
+        trellis::strip_interior(sverts, sfaces, strip);
+        audit("strip_interior", sfaces);
+        printf("  [strip %.1fs]\n", now()-t); t = now();
+    }
 
     std::vector<float> dv, dp; std::vector<int32_t> df;
     if (decim > 0) trellis::decimate_cluster(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, {}, decim, dv, df, dp);

@@ -12,6 +12,7 @@
 #include "uv_bake.h"
 #include "tri_bvh.h"
 #include "remesh_dc.h"
+#include "strip_interior.h"
 #include "stb_image_write.h"
 #include "trellis_run.h"
 
@@ -400,16 +401,31 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             printf("  remesh postproc: dropped %d floater comps -> V=%d F=%d\n", ndrop, rm.V(), rm.F());
             fflush(stdout);
         }
-        const std::vector<float>& sverts = rm.F() > 0 ? rm.verts : mesh.verts;
-        const std::vector<int32_t>& sfaces = rm.F() > 0 ? rm.faces : mesh.faces;
+        std::vector<float>& sverts = rm.F() > 0 ? rm.verts : mesh.verts;
+        std::vector<int32_t>& sfaces = rm.F() > 0 ? rm.faces : mesh.faces;
+
+        // Opt-in: drop the buried sheets of the narrow-band shell before
+        // simplifying. remesh_dc contours an UNSIGNED distance field, so its
+        // level set is an offset surface on both sides of the input, and the
+        // FlexiDualGrid mesh it is handed is already two-walled - four nested
+        // sheets, of which one is the object. The buried ones are invisible and,
+        // being crumpled where the offset self-intersects, they read to a
+        // quadric decimator as detail worth keeping and take most of the budget.
+        // See strip_interior.h. No-op on meshes that have no buried sheet.
+        if (cfg.strip_interior) {
+            trellis::StripOpts so2;
+            trellis::strip_interior(sverts, sfaces, so2);
+        }
         std::vector<float> dv, dp; std::vector<int32_t> df;
         if (cfg.decim > 0) {
             trellis::decimate_cluster(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, {}, cfg.decim, dv, df, dp);
         } else if (cfg.decim == 0) {
             dv = sverts; df = sfaces;
         } else {
+            // Face budget: explicit --faces wins, else the per-cascade default.
+            const int target = cfg.faces > 0 ? cfg.faces : (cascade ? 300000 : 150000);
             trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3,
-                                  cascade ? 300000 : 150000, dv, df);
+                                  target, dv, df);
             trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)so.res * 8.0f));
             trellis::fill_small_holes(df);
             // Second component pass on the decimated mesh: a hallucinated ground plane

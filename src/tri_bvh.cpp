@@ -156,4 +156,79 @@ TriBvh::Hit TriBvh::closest(const float p[3], float max_dist) const {
     return hit;
 }
 
+TriBvh::RayHit TriBvh::ray(const float org[3], const float dir[3], float max_t) const {
+    RayHit hit;
+    if (nodes_.empty()) return hit;
+    hit.t = max_t;
+
+    // Slab test, precomputed reciprocals. Infinities are intentional: a zero
+    // component gives +/-inf here and the comparisons below still order
+    // correctly, which is the standard branch-free slab formulation.
+    const float inv[3] = {1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]};
+    auto box_t = [&](const float bmin[3], const float bmax[3]) -> float {
+        float t0 = 0.0f, t1 = hit.t;
+        for (int k = 0; k < 3; ++k) {
+            float a = (bmin[k] - org[k]) * inv[k];
+            float b = (bmax[k] - org[k]) * inv[k];
+            if (a > b) { const float s = a; a = b; b = s; }
+            if (a > t0) t0 = a;
+            if (b < t1) t1 = b;
+            if (t0 > t1) return 1e30f;
+        }
+        return t0;
+    };
+
+    struct Entry { float t; int32_t node; };
+    Entry stack[64];
+    int sp = 0;
+    const float t0root = box_t(nodes_[0].bmin, nodes_[0].bmax);
+    if (t0root >= hit.t) return hit;
+    stack[sp++] = {t0root, 0};
+    while (sp > 0) {
+        const Entry e = stack[--sp];
+        if (e.t >= hit.t) continue;              // a closer surface was already found
+        const Node& n = nodes_[e.node];
+        if (n.count > 0) {
+            for (int32_t i = 0; i < n.count; ++i) {
+                const int32_t f = prim_[n.left + i];
+                // Moller-Trumbore. Two-sided: an inverted sheet still counts as
+                // a surface you can see, which is the whole point here.
+                const float* a = &verts_[3*faces_[3*f]];
+                const float* b = &verts_[3*faces_[3*f+1]];
+                const float* c = &verts_[3*faces_[3*f+2]];
+                float e1[3], e2[3], pv[3];
+                for (int k = 0; k < 3; ++k) { e1[k] = b[k]-a[k]; e2[k] = c[k]-a[k]; }
+                pv[0] = dir[1]*e2[2] - dir[2]*e2[1];
+                pv[1] = dir[2]*e2[0] - dir[0]*e2[2];
+                pv[2] = dir[0]*e2[1] - dir[1]*e2[0];
+                const float det = dot3(e1, pv);
+                if (std::fabs(det) < 1e-20f) continue;   // ray parallel to the triangle
+                const float invDet = 1.0f / det;
+                float tv[3], qv[3];
+                for (int k = 0; k < 3; ++k) tv[k] = org[k]-a[k];
+                const float u = dot3(tv, pv) * invDet;
+                if (u < 0.0f || u > 1.0f) continue;
+                qv[0] = tv[1]*e1[2] - tv[2]*e1[1];
+                qv[1] = tv[2]*e1[0] - tv[0]*e1[2];
+                qv[2] = tv[0]*e1[1] - tv[1]*e1[0];
+                const float v = dot3(dir, qv) * invDet;
+                if (v < 0.0f || u + v > 1.0f) continue;
+                const float t = dot3(e2, qv) * invDet;
+                if (t > 1e-7f && t < hit.t) { hit.t = t; hit.face = f; }
+            }
+            continue;
+        }
+        const int32_t l = n.left, r = n.left + 1;
+        float tl = box_t(nodes_[l].bmin, nodes_[l].bmax);
+        float tr = box_t(nodes_[r].bmin, nodes_[r].bmax);
+        int32_t first = l, second = r;
+        if (tr < tl) { const float s = tl; tl = tr; tr = s; first = r; second = l; }
+        if (sp + 2 <= 64) {
+            if (tr < hit.t) stack[sp++] = {tr, second};   // farther child first
+            if (tl < hit.t) stack[sp++] = {tl, first};
+        }
+    }
+    return hit;
+}
+
 }  // namespace trellis
