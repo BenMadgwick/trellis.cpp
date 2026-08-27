@@ -45,6 +45,12 @@ struct TrellisParams {
                                 //   the thin-wall reference look, 2 for a thicker shell).
     int  faces    = -1;         // QEM face budget            (-1 => per-cascade default)
     bool strip_interior = false; // drop buried sheets before simplifying
+    bool normal_map = false;    // bake a tangent-space normal map from the stripped
+                                //   high-poly. Requires strip_interior: against the
+                                //   four-sheet shell the bake samples buried,
+                                //   inward-facing geometry and returns noise.
+    float normal_search = 2.0f; // ray/closest-point bound, in multiples of the local
+                                //   low-poly edge length (scales with the face target)
     int  decim    = -1;         // decimation cluster grid   (-1 => per-cascade default)
     int  tex      = -1;         // UV atlas size in px        (-1 => per-cascade default)
     int  tex_res  = -1;         // texture PBR resolution: -1 => auto (drop dense res-1024 tex to

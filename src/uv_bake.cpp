@@ -3,6 +3,7 @@
 #include "meshoptimizer.h"
 #include "Simplify.h"
 #include "tri_bvh.h"
+#include "shading.h"
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -93,6 +94,161 @@ struct VoxSampler {
         return false;
     }
 };
+
+// Samples the high-poly's interpolated normal at the surface point nearest a
+// low-poly texel.
+//
+// Ray-along-normal first, closest-point as the fallback. Neither alone is
+// enough: a pure closest-point query jumps across thin gaps (grabbing the inside
+// of an ear from a texel on its outside), and a pure ray query drops out
+// wherever the high-poly has a hole or the ray grazes. Casting first and falling
+// back keeps the ray's correctness where it hits and the closest-point's total
+// coverage where it does not, with no cage geometry to build.
+struct NormalSampler {
+    const NormalSrc& src;
+    float sign = 1.f;   // global winding sign, resolved against the low-poly
+
+    explicit NormalSampler(const NormalSrc& s) : src(s) {}
+
+    // Barycentric interpolation of the high-poly vertex normals at `p` on `face`.
+    void normal_at(int32_t face, const float p[3], float out[3]) const {
+        const int32_t a = src.faces[3*face], b = src.faces[3*face+1], c = src.faces[3*face+2];
+        const float *A = &src.verts[3*a], *B = &src.verts[3*b], *C = &src.verts[3*c];
+        float v0[3], v1[3], v2[3];
+        for (int k = 0; k < 3; ++k) { v0[k] = B[k]-A[k]; v1[k] = C[k]-A[k]; v2[k] = p[k]-A[k]; }
+        const float d00 = v0[0]*v0[0]+v0[1]*v0[1]+v0[2]*v0[2];
+        const float d01 = v0[0]*v1[0]+v0[1]*v1[1]+v0[2]*v1[2];
+        const float d11 = v1[0]*v1[0]+v1[1]*v1[1]+v1[2]*v1[2];
+        const float d20 = v2[0]*v0[0]+v2[1]*v0[1]+v2[2]*v0[2];
+        const float d21 = v2[0]*v1[0]+v2[1]*v1[1]+v2[2]*v1[2];
+        const float den = d00*d11 - d01*d01;
+        float w1 = 0.f, w2 = 0.f;
+        if (std::fabs(den) > 1e-24f) {
+            w1 = (d11*d20 - d01*d21) / den;
+            w2 = (d00*d21 - d01*d20) / den;
+        }
+        const float w0 = 1.f - w1 - w2;
+        const float *NA = &src.vnrm[3*a], *NB = &src.vnrm[3*b], *NC = &src.vnrm[3*c];
+        for (int k = 0; k < 3; ++k) out[k] = w0*NA[k] + w1*NB[k] + w2*NC[k];
+        const float l = std::sqrt(out[0]*out[0]+out[1]*out[1]+out[2]*out[2]);
+        if (l > 1e-20f) { for (int k = 0; k < 3; ++k) out[k] /= l; }
+        else { out[0]=0.f; out[1]=0.f; out[2]=1.f; }
+    }
+
+    // Raw (pre-sign) high-poly normal for a texel at `p` with low-poly normal
+    // `n_lo`, searching at most `bound`. Returns false if nothing usable was
+    // found. Candidates are tried nearest-first and, when `reject_back` is set,
+    // a candidate facing away from the low-poly is skipped rather than encoded.
+    //
+    // The rejection is not cosmetic. The stripped shell is open (the strip
+    // removes sheets, and with them watertightness), so a ray can pass through a
+    // hole and strike the far side of the object from behind, yielding a normal
+    // ~180 deg wrong. A normal map cannot legitimately encode a tilt past 90 deg
+    // on a surface the low-poly was decimated from, so any such hit is a miss,
+    // not a measurement -- and left in, it is the black-speck artefact all over
+    // again, now baked into the texture where no geometry fix can reach it.
+    bool sample_raw(const float p[3], const float n_lo[3], float bound, float out[3],
+                    bool reject_back, float sgn) const {
+        struct Cand { float t; int32_t face; float pt[3]; };
+        Cand c[3]; int nc = 0;
+        for (int s = 0; s < 2; ++s) {
+            const float d[3] = { s ? -n_lo[0] : n_lo[0], s ? -n_lo[1] : n_lo[1], s ? -n_lo[2] : n_lo[2] };
+            const TriBvh::RayHit h = src.bvh->ray(p, d, bound);
+            if (h.face >= 0) {
+                c[nc].t = h.t; c[nc].face = h.face;
+                for (int k = 0; k < 3; ++k) c[nc].pt[k] = p[k] + d[k]*h.t;
+                ++nc;
+            }
+        }
+        const TriBvh::Hit cl = src.bvh->closest(p, bound);
+        if (cl.face >= 0) {
+            c[nc].t = std::sqrt(cl.dist2); c[nc].face = cl.face;
+            for (int k = 0; k < 3; ++k) c[nc].pt[k] = cl.point[k];
+            ++nc;
+        }
+        if (!nc) return false;
+        // nearest first: the ray hits usually beat the closest point, but where
+        // a ray has punched through a hole the closest point is the better guess
+        int ord[3] = {0,1,2};
+        for (int i = 1; i < nc; ++i)
+            for (int j = i; j > 0 && c[ord[j]].t < c[ord[j-1]].t; --j) { const int tmp=ord[j]; ord[j]=ord[j-1]; ord[j-1]=tmp; }
+        for (int i = 0; i < nc; ++i) {
+            const Cand& k = c[ord[i]];
+            normal_at(k.face, k.pt, out);
+            if (!reject_back) return true;
+            if (sgn*(out[0]*n_lo[0] + out[1]*n_lo[1] + out[2]*n_lo[2]) > 0.f) return true;
+        }
+        return false;
+    }
+
+    // clean_mesh unifies winding by BFS, which fixes consistency but not global
+    // orientation -- the whole shell can come out inward. Decide once, by
+    // consensus over a spread of low-poly faces, rather than per texel (which
+    // would silently erase every genuine deviation past 90 deg).
+    void resolve_sign(const std::vector<float>& lverts, const std::vector<int32_t>& lfaces,
+                      const std::vector<float>& lnrm, int lF) {
+        double acc = 0.0; int used = 0;
+        const int stride = lF > 512 ? lF / 512 : 1;
+        for (int f = 0; f < lF; f += stride) {
+            const int i0 = lfaces[3*f], i1 = lfaces[3*f+1], i2 = lfaces[3*f+2];
+            float c[3], n[3];
+            for (int k = 0; k < 3; ++k) {
+                c[k] = (lverts[3*i0+k] + lverts[3*i1+k] + lverts[3*i2+k]) / 3.f;
+                n[k] = (lnrm[3*i0+k] + lnrm[3*i1+k] + lnrm[3*i2+k]) / 3.f;
+            }
+            const float l = std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+            if (l <= 1e-20f) continue;
+            for (int k = 0; k < 3; ++k) n[k] /= l;
+            float e0[3], e1[3];
+            for (int k = 0; k < 3; ++k) { e0[k] = lverts[3*i1+k]-lverts[3*i0+k]; e1[k] = lverts[3*i2+k]-lverts[3*i0+k]; }
+            const float edge = std::sqrt(std::max(e0[0]*e0[0]+e0[1]*e0[1]+e0[2]*e0[2],
+                                                  e1[0]*e1[0]+e1[1]*e1[1]+e1[2]*e1[2]));
+            float hi[3];
+            if (!sample_raw(c, n, std::max(edge * src.search_scale, 1e-4f), hi, false, 1.f)) continue;
+            acc += n[0]*hi[0] + n[1]*hi[1] + n[2]*hi[2];
+            ++used;
+        }
+        sign = (used > 0 && acc < 0.0) ? -1.f : 1.f;
+        printf("  normal_bake: winding consensus over %d faces -> sign %+.0f (mean dot %.3f)\n",
+               used, sign, used ? (float)(acc/used) : 0.f);
+        fflush(stdout);
+    }
+};
+
+// Seam padding for the normal map. Nearest-neighbour copy, never an average:
+// blending two normals across a chart border produces a direction that is on
+// neither surface, and bilinear filtering at the seam then samples it. Texels
+// that no chart reached get the identity normal (flat), so an unmapped region
+// falls back to the interpolated vertex normal instead of tilting the surface
+// somewhere arbitrary.
+void dilate_normals(std::vector<uint8_t>& img, std::vector<uint8_t>& mask, int T, bool tangent_space) {
+    std::vector<int> queue;
+    queue.reserve((size_t)T * T / 4);
+    for (int y = 0; y < T; ++y) for (int x = 0; x < T; ++x)
+        if (mask[(size_t)y*T + x]) queue.push_back(y*T + x);
+    const bool any = !queue.empty();
+    static const int DX[4] = {1, -1, 0, 0}, DY[4] = {0, 0, 1, -1};
+    for (size_t qi = 0; qi < queue.size(); ++qi) {
+        const int t = queue[qi], x = t % T, y = t / T;
+        for (int d = 0; d < 4; ++d) {
+            const int xx = x + DX[d], yy = y + DY[d];
+            if (xx < 0 || yy < 0 || xx >= T || yy >= T) continue;
+            const size_t n = (size_t)yy*T + xx;
+            if (mask[n]) continue;
+            std::memcpy(&img[4*n], &img[4*(size_t)t], 4);
+            mask[n] = 1;
+            queue.push_back((int)n);
+        }
+    }
+    if (!any) {
+        // Nothing was baked at all -- leave a valid flat map rather than black,
+        // which decodes to a normal pointing into the surface.
+        for (size_t i = 0; i < (size_t)T*T; ++i) {
+            img[4*i+0] = 128; img[4*i+1] = 128;
+            img[4*i+2] = tangent_space ? 255 : 128; img[4*i+3] = 255;
+        }
+    }
+}
 
 // Multi-source BFS dilation: every unwritten texel takes the color of its
 // nearest written one. Bounded passes leave unshaded islands wherever a region
@@ -883,7 +1039,8 @@ BakedMesh uv_chart_project(const std::vector<float>& verts, int V, const std::ve
 }
 
 BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
-                  const std::vector<float>& pbr6, int texsize, const VoxelPbr* vox) {
+                  const std::vector<float>& pbr6, int texsize, const VoxelPbr* vox,
+                  const NormalSrc* nsrc) {
     BakedMesh out;
     std::unique_ptr<VoxSampler> vs;
     if (vox && vox->ok()) vs.reset(new VoxSampler(*vox));
@@ -1381,11 +1538,54 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     }
     const int FoAll = (int)out.faces.size() / 3;
 
+    // --- shading frame + normal-bake setup ---
+    // Computed here, on the finished atlas mesh, and handed to the GLB writer.
+    // The writer must not recompute: a tangent-space map is a delta against this
+    // exact basis and any disagreement is invisible in the texture but wrong
+    // under every light.
+    const int Vo = (int)out.verts.size() / 3;
+    std::unique_ptr<NormalSampler> ns;
+    std::vector<uint8_t> nmask;
+    std::vector<float> face_bound;      // per-face search radius (world units)
+    if (nsrc && nsrc->ok() && FoAll > 0) {
+        vertex_normals(out.verts.data(), Vo, out.faces.data(), FoAll, out.vnrm);
+        if (nsrc->tangent_space)
+            vertex_tangents(out.verts.data(), Vo, out.uv.data(), out.faces.data(), FoAll,
+                            out.vnrm, out.vtan);
+        out.nrm_tangent_space = nsrc->tangent_space;
+        out.nrm.assign((size_t)T * T * 4, 0);
+        nmask.assign((size_t)T * T, 0);
+        // Drift from the high-poly scales with triangle size, so bound the
+        // search per face rather than by one global constant. This is what lets
+        // the same code serve a 1 K target and a 300 K one without a retune.
+        face_bound.resize(FoAll);
+        for (int f = 0; f < FoAll; ++f) {
+            const int i0 = out.faces[3*f], i1 = out.faces[3*f+1], i2 = out.faces[3*f+2];
+            float m = 0.f;
+            const int ix[3] = {i0, i1, i2};
+            for (int j = 0; j < 3; ++j) {
+                const int a = ix[j], b = ix[(j+1)%3];
+                float d = 0.f;
+                for (int k = 0; k < 3; ++k) { const float e = out.verts[3*a+k]-out.verts[3*b+k]; d += e*e; }
+                m = std::max(m, d);
+            }
+            face_bound[f] = std::max(std::sqrt(m) * nsrc->search_scale, 1e-4f);
+        }
+        ns.reset(new NormalSampler(*nsrc));
+        ns->resolve_sign(out.verts, out.faces, out.vnrm, FoAll);
+    }
+
     // --- rasterize into the atlas ---
     out.T = T;
     out.base.assign((size_t)T * T * 4, 0);
     out.mr.assign((size_t)T * T * 4, 0);
     std::vector<uint8_t> mask((size_t)T * T, 0);
+    // Angular deviation of the high-poly normal from the low-poly's shading
+    // normal, in degrees. This is exactly the signal the map carries: if it is
+    // near zero everywhere there is nothing to bake, and the histogram says so
+    // before anyone renders anything.
+    std::vector<uint32_t> devhist(181, 0);
+    size_t nrm_hits = 0, nrm_miss = 0;
     auto u8 = [](float v){ v = v*255.f; return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); };
     for (int f = 0; f < FoAll; ++f) {
         int idx[3] = { (int)out.faces[3*f], (int)out.faces[3*f+1], (int)out.faces[3*f+2] };
@@ -1420,11 +1620,81 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
                 out.mr[4*t+0]=0; out.mr[4*t+1]=u8(s[4]); out.mr[4*t+2]=u8(s[3]); out.mr[4*t+3]=255;
                 mask[t] = 1;
             }
+            if (ns) {
+                // Interpolated low-poly shading normal at this texel: both the
+                // ray direction and the frame the result is expressed in.
+                float p[3], n_lo[3];
+                for (int a = 0; a < 3; ++a) {
+                    p[a] = w0*out.verts[3*idx[0]+a] + w1*out.verts[3*idx[1]+a] + w2*out.verts[3*idx[2]+a];
+                    n_lo[a] = w0*out.vnrm[3*idx[0]+a] + w1*out.vnrm[3*idx[1]+a] + w2*out.vnrm[3*idx[2]+a];
+                }
+                float ll = std::sqrt(n_lo[0]*n_lo[0]+n_lo[1]*n_lo[1]+n_lo[2]*n_lo[2]);
+                if (ll > 1e-20f) {
+                    for (int a = 0; a < 3; ++a) n_lo[a] /= ll;
+                    float hi[3];
+                    if (ns->sample_raw(p, n_lo, face_bound[f], hi, true, ns->sign)) {
+                        for (int a = 0; a < 3; ++a) hi[a] *= ns->sign;
+                        const float dot = std::max(-1.f, std::min(1.f,
+                            hi[0]*n_lo[0] + hi[1]*n_lo[1] + hi[2]*n_lo[2]));
+                        const int deg = (int)(std::acos(dot) * 57.2957795f + 0.5f);
+                        ++devhist[deg < 0 ? 0 : (deg > 180 ? 180 : deg)];
+                        float enc[3] = { hi[0], hi[1], hi[2] };
+                        if (ns->src.tangent_space) {
+                            // World -> tangent. Interpolating T across the face
+                            // and re-orthogonalising against the interpolated N
+                            // is what a GPU does when it builds the frame from
+                            // the same vertex attributes, so the bake inverts
+                            // exactly the transform the runtime will apply.
+                            float Ti[3] = {0,0,0};
+                            const float wv[3] = {w0, w1, w2};
+                            for (int j = 0; j < 3; ++j)
+                                for (int a = 0; a < 3; ++a) Ti[a] += wv[j]*out.vtan[4*idx[j]+a];
+                            const float d = Ti[0]*n_lo[0] + Ti[1]*n_lo[1] + Ti[2]*n_lo[2];
+                            for (int a = 0; a < 3; ++a) Ti[a] -= n_lo[a]*d;
+                            float tl = std::sqrt(Ti[0]*Ti[0]+Ti[1]*Ti[1]+Ti[2]*Ti[2]);
+                            if (tl > 1e-12f) {
+                                for (int a = 0; a < 3; ++a) Ti[a] /= tl;
+                                const float hw = out.vtan[4*idx[0]+3];
+                                const float Bi[3] = {
+                                    hw * (n_lo[1]*Ti[2] - n_lo[2]*Ti[1]),
+                                    hw * (n_lo[2]*Ti[0] - n_lo[0]*Ti[2]),
+                                    hw * (n_lo[0]*Ti[1] - n_lo[1]*Ti[0]) };
+                                enc[0] = hi[0]*Ti[0] + hi[1]*Ti[1] + hi[2]*Ti[2];
+                                enc[1] = hi[0]*Bi[0] + hi[1]*Bi[1] + hi[2]*Bi[2];
+                                enc[2] = hi[0]*n_lo[0] + hi[1]*n_lo[1] + hi[2]*n_lo[2];
+                            } else {
+                                enc[0] = 0.f; enc[1] = 0.f; enc[2] = 1.f;
+                            }
+                        }
+                        out.nrm[4*t+0] = u8(enc[0]*0.5f + 0.5f);
+                        out.nrm[4*t+1] = u8(enc[1]*0.5f + 0.5f);
+                        out.nrm[4*t+2] = u8(enc[2]*0.5f + 0.5f);
+                        out.nrm[4*t+3] = 255;
+                        nmask[t] = 1;
+                        ++nrm_hits;
+                    } else ++nrm_miss;
+                }
+            }
         }
     }
     xatlas::Destroy(atlas);
 
     telea_inpaint(out.base, out.mr, mask, T, 3, 1);
+    if (ns) {
+        dilate_normals(out.nrm, nmask, T, nsrc->tangent_space);
+        size_t cum = 0; const size_t tot = nrm_hits ? nrm_hits : 1;
+        int p50 = 0, p90 = 0, p99 = 0;
+        for (int d = 0; d <= 180; ++d) {
+            cum += devhist[d];
+            if (!p50 && cum*100 >= tot*50) p50 = d;
+            if (!p90 && cum*100 >= tot*90) p90 = d;
+            if (!p99 && cum*100 >= tot*99) p99 = d;
+        }
+        printf("  normal_bake: %zu texels (%zu unreachable, %.2f%%), deviation p50=%ddeg p90=%ddeg p99=%ddeg, %s space\n",
+               nrm_hits, nrm_miss, 100.0 * nrm_miss / (double)(nrm_hits + nrm_miss ? nrm_hits + nrm_miss : 1),
+               p50, p90, p99, nsrc->tangent_space ? "tangent" : "object");
+        fflush(stdout);
+    }
     printf("  uv_bake: atlas %dx%d (xatlas %dx%d), Vo=%zu Fo=%d\n", T, T, W, H, out.verts.size()/3, FoAll);
     fflush(stdout);
     return out;

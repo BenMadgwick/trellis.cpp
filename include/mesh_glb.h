@@ -16,11 +16,22 @@ bool write_glb(const char* path, const float* verts, int64_t V, const int32_t* f
 // double_sided=false matches the reference's remeshed output (consistent orientation);
 // pass true for un-remeshed fallback paths where winding is not guaranteed.
 // use_webp=false forces PNG textures even in a WebP-enabled build (--webp off).
+//
+// Normal map (all three optional, all-or-nothing): `nrm_rgba` is a [T*T*4]
+// tangent-space map, `vnrm` [V*3] and `vtan4` [V*4] the shading frame it was
+// baked against, both in TRELLIS space (rotated here alongside the positions).
+// Supplying the frame is not an optimisation -- glTF has no way to say "these
+// normals came from a different basis than the tangents", so a map baked against
+// one frame and shipped with another is silently wrong under every light. When
+// `vnrm` is null the writer computes normals itself, which is correct only
+// because there is then no map to disagree with.
 bool write_glb_textured(const char* path, const float* verts, int64_t V, const float* uv,
                         const int32_t* faces, int64_t F,
                         const unsigned char* base_rgba, const unsigned char* mr_rgba, int T,
                         bool double_sided = false, int64_t seed = -1, const char* copyright = nullptr,
-                        bool use_webp = true);
+                        bool use_webp = true,
+                        const unsigned char* nrm_rgba = nullptr,
+                        const float* vnrm = nullptr, const float* vtan4 = nullptr);
 
 // Debug helper: binary little-endian PLY in raw TRELLIS space (no axis swap).
 // colors: optional [V*3] float RGB in [0,1] -> written as uchar red/green/blue per vertex.

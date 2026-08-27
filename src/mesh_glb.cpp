@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdarg>
 #include <cfloat>
 #include <ctime>
 #include <string>
@@ -278,7 +279,8 @@ bool write_glb(const char* path, const float* verts, int64_t V, const int32_t* f
 bool write_glb_textured(const char* path, const float* verts, int64_t V, const float* uv,
                         const int32_t* faces, int64_t F,
                         const unsigned char* base_rgba, const unsigned char* mr_rgba, int T,
-                        bool double_sided, int64_t seed, const char* copyright, bool use_webp) {
+                        bool double_sided, int64_t seed, const char* copyright, bool use_webp,
+                        const unsigned char* nrm_rgba, const float* vnrm, const float* vtan4) {
     // rotate positions (x,z,-y) + min/max
     std::vector<float> pos((size_t)V*3);
     float mn[3]={FLT_MAX,FLT_MAX,FLT_MAX}, mx[3]={-FLT_MAX,-FLT_MAX,-FLT_MAX};
@@ -286,6 +288,18 @@ bool write_glb_textured(const char* path, const float* verts, int64_t V, const f
         for(int c=0;c<3;++c){pos[3*i+c]=p[c]; mn[c]=std::min(mn[c],p[c]); mx[c]=std::max(mx[c],p[c]);} }
     if (V==0){mn[0]=mn[1]=mn[2]=0;mx[0]=mx[1]=mx[2]=0;}
 
+    // Vertex normals. When the caller baked a normal map it MUST hand us the
+    // frame it baked against -- a tangent-space map is a delta from that basis,
+    // and recomputing here (even by the same formula) risks encoding one basis
+    // and decoding another. Only rotate into the glTF frame; the rotation is
+    // proper (det +1) so normals and tangents transform like positions.
+    std::vector<float> nrm((size_t)V*3, 0.f);
+    if (vnrm) {
+        for (int64_t i = 0; i < V; ++i) {
+            const float ox=vnrm[3*i], oy=vnrm[3*i+1], oz=vnrm[3*i+2];
+            nrm[3*i+0]=ox; nrm[3*i+1]=oz; nrm[3*i+2]=-oy;
+        }
+    } else {
     // area-weighted vertex normals (in the rotated frame) so viewers shade
     // smoothly instead of the glTF-mandated flat fallback.
     // Accumulate on POSITION-WELDED groups: xatlas duplicates vertices along UV
@@ -310,7 +324,6 @@ bool write_glb_textured(const char* path, const float* verts, int64_t V, const f
             rep[i] = first.emplace(k, i).first->second;
         }
     }
-    std::vector<float> nrm((size_t)V*3, 0.f);
     for (int64_t f=0;f<F;++f){
         const int64_t a=faces[3*f], b=faces[3*f+1], c=faces[3*f+2];
         float e1[3], e2[3], n[3];
@@ -327,10 +340,23 @@ bool write_glb_textured(const char* path, const float* verts, int64_t V, const f
         const int64_t r=rep[i];
         if (r != i) for(int k=0;k<3;++k) nrm[3*i+k]=nrm[3*r+k];
     }
+    }   // end of the compute-our-own branch
+
+    // Tangents: rotate the supplied ones, preserving w (handedness is a scalar
+    // and survives a proper rotation untouched).
+    const bool have_nmap = nrm_rgba && vnrm && vtan4;
+    std::vector<float> tan4;
+    if (have_nmap) {
+        tan4.resize((size_t)V*4);
+        for (int64_t i = 0; i < V; ++i) {
+            const float ox=vtan4[4*i], oy=vtan4[4*i+1], oz=vtan4[4*i+2];
+            tan4[4*i+0]=ox; tan4[4*i+1]=oz; tan4[4*i+2]=-oy; tan4[4*i+3]=vtan4[4*i+3];
+        }
+    }
 
     // encode textures — lossy WebP at the reference's quality when available,
     // PNG otherwise
-    std::vector<uint8_t> pngB, pngM;
+    std::vector<uint8_t> pngB, pngM, pngN;
     bool webp = false;
 #ifdef TRELLIS_HAVE_WEBP
     if (use_webp) {
@@ -349,56 +375,98 @@ bool write_glb_textured(const char* path, const float* verts, int64_t V, const f
         stbi_write_png_to_func(png_collect, &pngB, T, T, 4, base_rgba, T*4);
         stbi_write_png_to_func(png_collect, &pngM, T, T, 4, mr_rgba, T*4);
     }
+    // The normal map is always PNG, never the lossy WebP the colour maps use.
+    // At quality 80 WebP shifts channel values by a few LSBs, which is invisible
+    // in albedo and is a visible faceted wobble once those values are decoded as
+    // a direction and lit. Roughly 3 MB against a 2048 atlas -- worth it.
+    if (have_nmap) stbi_write_png_to_func(png_collect, &pngN, T, T, 4, nrm_rgba, T*4);
 
     auto pad4=[](std::vector<uint8_t>&b){ while(b.size()%4) b.push_back(0); };
+    // Tangents are appended after the indices so bufferViews 0-3 keep the byte
+    // offsets they always had; the new views take indices 6 and 7.
     const uint32_t posB=(uint32_t)(V*12), nrmB=(uint32_t)(V*12), uvB=(uint32_t)(V*8), idxB=(uint32_t)(F*12);
-    std::vector<uint8_t> bin(posB+nrmB+uvB+idxB);
+    const uint32_t tanB = have_nmap ? (uint32_t)(V*16) : 0u;
+    const uint32_t tanOff = posB+nrmB+uvB+idxB;
+    std::vector<uint8_t> bin(tanOff + tanB);
     std::memcpy(bin.data(), pos.data(), posB);
     std::memcpy(bin.data()+posB, nrm.data(), nrmB);
     std::memcpy(bin.data()+posB+nrmB, uv, uvB);
     for (int64_t i=0;i<F*3;++i){ uint32_t v=(uint32_t)faces[i]; std::memcpy(bin.data()+posB+nrmB+uvB+i*4,&v,4); }
+    if (have_nmap) std::memcpy(bin.data()+tanOff, tan4.data(), tanB);
     pad4(bin); const uint32_t off4=(uint32_t)bin.size();
     bin.insert(bin.end(), pngB.begin(), pngB.end()); pad4(bin); const uint32_t off5=(uint32_t)bin.size();
     bin.insert(bin.end(), pngM.begin(), pngM.end()); pad4(bin);
+    uint32_t off7 = 0;
+    if (have_nmap) { off7 = (uint32_t)bin.size(); bin.insert(bin.end(), pngN.begin(), pngN.end()); pad4(bin); }
 
     const std::string asset_meta = asset_extras_json(seed);
     const std::string generator = generator_label();
     const std::string asset_copyright = asset_copyright_json(copyright);
 
-    char buf[4096];
-    std::snprintf(buf,sizeof(buf),
-        "{\"asset\":{\"version\":\"2.0\",\"minVersion\":\"2.0\",\"generator\":\"%s\"%s%s},"
-        "%s"
-        "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}],"
-        "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0,\"mode\":4}]}],"
-        "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0},\"metallicRoughnessTexture\":{\"index\":1},\"metallicFactor\":1.0,\"roughnessFactor\":1.0},\"alphaMode\":\"OPAQUE\",\"doubleSided\":%s}],"
-        "%s"
-        "\"images\":[{\"bufferView\":4,\"mimeType\":\"%s\"},{\"bufferView\":5,\"mimeType\":\"%s\"}],"
-        "\"samplers\":[{}],"
-        "\"accessors\":["
-        "{\"bufferView\":0,\"componentType\":5126,\"count\":%lld,\"type\":\"VEC3\",\"min\":[%.9g,%.9g,%.9g],\"max\":[%.9g,%.9g,%.9g]},"
-        "{\"bufferView\":1,\"componentType\":5126,\"count\":%lld,\"type\":\"VEC3\"},"
-        "{\"bufferView\":2,\"componentType\":5126,\"count\":%lld,\"type\":\"VEC2\"},"
-        "{\"bufferView\":3,\"componentType\":5125,\"count\":%lld,\"type\":\"SCALAR\"}],"
-        "\"bufferViews\":["
-        "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":%u,\"target\":34962},"
-        "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962},"
-        "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962},"
-        "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34963},"
-        "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u},"
-        "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u}],"
-        "\"buffers\":[{\"byteLength\":%u}]}",
-        generator.c_str(), asset_copyright.c_str(), asset_meta.c_str(),
-        webp ? "\"extensionsUsed\":[\"EXT_texture_webp\"],\"extensionsRequired\":[\"EXT_texture_webp\"]," : "",
-        double_sided ? "true" : "false",
-        webp ? "\"textures\":[{\"sampler\":0,\"extensions\":{\"EXT_texture_webp\":{\"source\":0}}},{\"sampler\":0,\"extensions\":{\"EXT_texture_webp\":{\"source\":1}}}],"
-             : "\"textures\":[{\"source\":0,\"sampler\":0},{\"source\":1,\"sampler\":0}],",
-        webp ? "image/webp" : "image/png", webp ? "image/webp" : "image/png",
-        (long long)V, mn[0],mn[1],mn[2],mx[0],mx[1],mx[2],
-        (long long)V, (long long)V, (long long)(F*3),
-        posB, posB,nrmB, posB+nrmB,uvB, posB+nrmB+uvB,idxB,
-        off4,(uint32_t)pngB.size(), off5,(uint32_t)pngM.size(), (uint32_t)bin.size());
-    std::string json(buf);
+    // Assembled as strings rather than one fixed snprintf: the normal-map path
+    // adds an attribute, an accessor, two bufferViews, an image and a texture,
+    // which would overflow the 4 KB buffer this used to use.
+    char frag[1024];
+    auto fmt = [&frag](const char* f, ...) {
+        va_list ap; va_start(ap, f);
+        std::vsnprintf(frag, sizeof(frag), f, ap);
+        va_end(ap);
+        return std::string(frag);
+    };
+    const char* mime = webp ? "image/webp" : "image/png";
+
+    std::string json = "{\"asset\":{\"version\":\"2.0\",\"minVersion\":\"2.0\",\"generator\":\""
+        + generator + "\"" + asset_copyright + asset_meta + "},";
+    if (webp) json += "\"extensionsUsed\":[\"EXT_texture_webp\"],\"extensionsRequired\":[\"EXT_texture_webp\"],";
+    json += "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}],"
+            "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2";
+    if (have_nmap) json += ",\"TANGENT\":4";
+    json += "},\"indices\":3,\"material\":0,\"mode\":4}]}],";
+
+    json += "\"materials\":[{\"pbrMetallicRoughness\":{\"baseColorTexture\":{\"index\":0},"
+            "\"metallicRoughnessTexture\":{\"index\":1},\"metallicFactor\":1.0,\"roughnessFactor\":1.0}";
+    if (have_nmap) json += ",\"normalTexture\":{\"index\":2}";
+    json += std::string(",\"alphaMode\":\"OPAQUE\",\"doubleSided\":") + (double_sided ? "true" : "false") + "}],";
+
+    // The normal map stays PNG even in a WebP build, so its texture is a plain
+    // one while the colour maps go through EXT_texture_webp.
+    json += "\"textures\":[";
+    json += webp ? "{\"sampler\":0,\"extensions\":{\"EXT_texture_webp\":{\"source\":0}}},"
+                   "{\"sampler\":0,\"extensions\":{\"EXT_texture_webp\":{\"source\":1}}}"
+                 : "{\"source\":0,\"sampler\":0},{\"source\":1,\"sampler\":0}";
+    if (have_nmap) json += ",{\"source\":2,\"sampler\":0}";
+    json += "],";
+
+    json += fmt("\"images\":[{\"bufferView\":4,\"mimeType\":\"%s\"},{\"bufferView\":5,\"mimeType\":\"%s\"}",
+                mime, mime);
+    if (have_nmap) json += ",{\"bufferView\":7,\"mimeType\":\"image/png\"}";
+    json += "],\"samplers\":[{}],";
+
+    json += fmt("\"accessors\":["
+                "{\"bufferView\":0,\"componentType\":5126,\"count\":%lld,\"type\":\"VEC3\",\"min\":[%.9g,%.9g,%.9g],\"max\":[%.9g,%.9g,%.9g]},"
+                "{\"bufferView\":1,\"componentType\":5126,\"count\":%lld,\"type\":\"VEC3\"},"
+                "{\"bufferView\":2,\"componentType\":5126,\"count\":%lld,\"type\":\"VEC2\"},"
+                "{\"bufferView\":3,\"componentType\":5125,\"count\":%lld,\"type\":\"SCALAR\"}",
+                (long long)V, mn[0],mn[1],mn[2],mx[0],mx[1],mx[2],
+                (long long)V, (long long)V, (long long)(F*3));
+    if (have_nmap) json += fmt(",{\"bufferView\":6,\"componentType\":5126,\"count\":%lld,\"type\":\"VEC4\"}", (long long)V);
+    json += "],";
+
+    json += fmt("\"bufferViews\":["
+                "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":%u,\"target\":34962},"
+                "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962},"
+                "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962},"
+                "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34963},"
+                "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u},"
+                "{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u}",
+                posB, posB,nrmB, posB+nrmB,uvB, posB+nrmB+uvB,idxB,
+                off4,(uint32_t)pngB.size(), off5,(uint32_t)pngM.size());
+    if (have_nmap) {
+        json += fmt(",{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u,\"target\":34962}", tanOff, tanB);
+        json += fmt(",{\"buffer\":0,\"byteOffset\":%u,\"byteLength\":%u}", off7, (uint32_t)pngN.size());
+    }
+    json += "],";
+    json += fmt("\"buffers\":[{\"byteLength\":%u}]}", (uint32_t)bin.size());
     while (json.size()%4) json.push_back(' ');
 
     uint32_t total = 12 + 8 + (uint32_t)json.size() + 8 + (uint32_t)bin.size();

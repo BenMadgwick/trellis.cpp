@@ -37,6 +37,9 @@ void print_usage(const char* argv0, bool server) {
         "      --xatlas            xatlas UV unwrap (default)\n"
         "      --box-uv            voxel-native box projection (faster)\n"
         "      --faces N           QEM face budget (default: 300K @1024 / 150K @512)\n"
+        "      --normal-map        bake a tangent-space normal map from the high-poly\n"
+        "                          (requires --strip-interior)\n"
+        "      --normal-search K   normal-bake search bound, in local edge lengths (default 2)\n"
         "      --strip-interior    drop the buried sheets of the narrow-band shell before\n"
         "                          simplifying, so the budget is spent on the visible\n"
         "                          surface (no-op when nothing is buried)\n"
@@ -93,6 +96,8 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "--box-uv")               { p.xatlas = false; }
         else if (a == "--faces")                { const char* v = need(a.c_str()); if (!v) return false; p.faces = atoi(v); }
         else if (a == "--strip-interior")       { p.strip_interior = true; }
+        else if (a == "--normal-map")           { p.normal_map = true; }
+        else if (a == "--normal-search")        { const char* v = need(a.c_str()); if (!v) return false; p.normal_search = (float)atof(v); }
         else if (a == "--band")                 { const char* v = need(a.c_str()); if (!v) return false; p.band = atoi(v); }
         else if (a == "--decim")                { const char* v = need(a.c_str()); if (!v) return false; p.decim = atoi(v); }
         else if (a == "--atlas" || a == "--tex"){ const char* v = need(a.c_str()); if (!v) return false; p.tex = atoi(v); }

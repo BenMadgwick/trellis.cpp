@@ -100,6 +100,7 @@ add_library(trellis_core STATIC
   src/dual_grid.cpp
   src/preprocess.cpp
   src/uv_bake.cpp
+  src/shading.cpp
   src/birefnet.cpp
   thirdparty/xatlas/xatlas.cpp
   thirdparty/meshoptimizer/simplifier.cpp

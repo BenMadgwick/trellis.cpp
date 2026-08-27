@@ -13,6 +13,7 @@
 #include "tri_bvh.h"
 #include "remesh_dc.h"
 #include "strip_interior.h"
+#include "shading.h"
 #include "stb_image_write.h"
 #include "trellis_run.h"
 
@@ -440,19 +441,56 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // full material detail survives simplification.
         trellis::VoxelPbr vox{pbr_coords, &pbr6, pbr_res, &bvh};
         const std::vector<float> no_vp;
+
+        // Normal bake source: the STRIPPED shell (sverts/sfaces), with its own
+        // BVH and vertex normals. Deliberately not `bvh`, which covers the
+        // pre-remesh two-walled mesh -- that one is right for the albedo snap,
+        // which only needs a position, and wrong here, where which of the four
+        // sheets you land on is the entire answer.
+        trellis::NormalSrc nsrc;
+        trellis::TriBvh hi_bvh;
+        std::vector<float> hi_nrm;
+        const bool do_normal = cfg.normal_map && cfg.strip_interior;
+        if (cfg.normal_map && !cfg.strip_interior)
+            printf("      --normal-map ignored: it requires --strip-interior (baking against the\n"
+                   "      four-sheet shell samples buried geometry and yields noise)\n");
+        if (do_normal) {
+            hi_bvh = trellis::TriBvh::build(sverts.data(), (int64_t)sverts.size()/3,
+                                            sfaces.data(), (int64_t)sfaces.size()/3);
+            trellis::vertex_normals(sverts.data(), (int64_t)sverts.size()/3,
+                                    sfaces.data(), (int64_t)sfaces.size()/3, hi_nrm);
+            nsrc.verts = sverts.data(); nsrc.faces = sfaces.data(); nsrc.vnrm = hi_nrm.data();
+            nsrc.V = (int64_t)sverts.size()/3; nsrc.F = (int64_t)sfaces.size()/3;
+            nsrc.bvh = &hi_bvh;
+            nsrc.tangent_space = true;
+            nsrc.search_scale = cfg.normal_search;
+        }
+
         trellis::BakedMesh bm = boxuv ? trellis::uv_box_project(dv, dV, df, dF, no_vp, T, &vox)
-                                      : trellis::uv_bake(dv, dV, df, dF, no_vp, T, &vox);
+                                      : trellis::uv_bake(dv, dV, df, dF, no_vp, T, &vox,
+                                                         do_normal ? &nsrc : nullptr);
         if (!boxuv && !bm.ok()) bm = trellis::uv_chart_project(dv, dV, df, dF, no_vp, T, &vox);
         if (bm.ok()) {
+            const bool ship_nmap = bm.has_normal_map() && bm.nrm_tangent_space;
             trellis::write_glb_textured(outglb.c_str(), bm.verts.data(), (int64_t)bm.verts.size()/3, bm.uv.data(),
                                         bm.faces.data(), (int64_t)bm.faces.size()/3, bm.base.data(), bm.mr.data(), bm.T,
                                         /*double_sided=*/rm.F() == 0, run_seed,
                                         cfg.copyright.empty() ? nullptr : cfg.copyright.c_str(),
-                                        /*use_webp=*/cfg.webp != 0);
+                                        /*use_webp=*/cfg.webp != 0,
+                                        ship_nmap ? bm.nrm.data() : nullptr,
+                                        ship_nmap ? bm.vnrm.data() : nullptr,
+                                        ship_nmap ? bm.vtan.data() : nullptr);
             std::string tex = outglb.substr(0, outglb.find_last_of('.')) + "_base.png";
             stbi_write_png(tex.c_str(), bm.T, bm.T, 4, bm.base.data(), bm.T*4);
             textured = true;
-            printf("      textured GLB (atlas %d, +%s)\n", bm.T, tex.c_str());
+            if (ship_nmap) {
+                // Also written beside the GLB as a standalone file: consumers
+                // standalone file, and it needs its green channel inverted for
+                // rather than embedded; DirectX-convention pipelines invert green.
+                std::string nt = outglb.substr(0, outglb.find_last_of('.')) + "_normal.png";
+                stbi_write_png(nt.c_str(), bm.T, bm.T, 4, bm.nrm.data(), bm.T*4);
+                printf("      textured GLB (atlas %d, +%s, +%s)\n", bm.T, tex.c_str(), nt.c_str());
+            } else printf("      textured GLB (atlas %d, +%s)\n", bm.T, tex.c_str());
         } else printf("      uv_bake failed; falling back to vertex colors\n");
     }
     if (!textured)

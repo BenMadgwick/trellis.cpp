@@ -12,11 +12,48 @@ struct BakedMesh {
     std::vector<int32_t> faces;   // [Fo*3]
     std::vector<uint8_t> base;    // [T*T*4] RGBA base color
     std::vector<uint8_t> mr;      // [T*T*4] RGBA glTF metallic-roughness (G=rough, B=metal)
+    // Populated only when uv_bake() is given a NormalSrc. `nrm` is the baked
+    // normal map; `vnrm`/`vtan` are the shading frame it was baked against and
+    // MUST be the frame the GLB ships, or the map decodes against a basis that
+    // does not exist.
+    std::vector<uint8_t> nrm;     // [T*T*4] RGBA normal map (tangent or object space)
+    std::vector<float>   vnrm;    // [Vo*3] area-weighted vertex normals
+    std::vector<float>   vtan;    // [Vo*4] tangents, w = handedness (tangent space only)
+    bool nrm_tangent_space = false;
     int T = 0;
     bool ok() const { return T > 0 && !faces.empty(); }
+    bool has_normal_map() const { return !nrm.empty(); }
 };
 
 class TriBvh;
+
+// High-poly source for normal baking: the STRIPPED narrow-band shell, never the
+// raw remesh and never the pre-remesh .ply.
+//
+// This is not optional strictness. remesh_dc contours an unsigned field, so its
+// level set is a two-sided offset and the mesh it was handed was already
+// two-walled -- four nested sheets. A closest-point or short ray query lands on
+// a buried sheet roughly as often as on the visible one, and the buried sheets
+// face inward, so the baked normal would be ~180 deg wrong over much of the
+// surface. Stripping is a precondition, not a quality improvement.
+//
+// `vnrm` must come from trellis::vertex_normals over this same mesh. Winding is
+// consistent after clean_mesh but its GLOBAL sign is arbitrary (BFS orientation
+// unification has no notion of outward), so the baker resolves the sign against
+// the low-poly by consensus before encoding anything.
+struct NormalSrc {
+    const float*   verts = nullptr;   // [V*3] TRELLIS space
+    const int32_t* faces = nullptr;   // [F*3]
+    const float*   vnrm  = nullptr;   // [V*3] area-weighted vertex normals
+    int64_t V = 0, F = 0;
+    const TriBvh* bvh = nullptr;      // over THIS mesh
+    bool tangent_space = true;        // false -> object space (debug: needs no tangent frame)
+    // Search bound as a multiple of the local low-poly triangle's longest edge.
+    // Decimation error scales with triangle size, so a per-texel bound tracks
+    // drift across face targets instead of needing a retune at every tier.
+    float search_scale = 2.0f;
+    bool ok() const { return verts && faces && vnrm && bvh && F > 0; }
+};
 
 // Sparse per-voxel PBR field at grid resolution `res` (mesh space [-0.5,0.5]^3;
 // voxel i covers [i/res-0.5, (i+1)/res-0.5)). feats layout [N*6] in [0,1]:
@@ -92,8 +129,12 @@ int weld_vertices(std::vector<float>& verts, std::vector<int32_t>& faces,
 // verts [V*3], faces [F*3], pbr6 [V*6] per-vertex (base3, metallic, roughness, alpha) in [0,1].
 // Unwraps with xatlas, shades texels from `vox` (trilinear volume sampling) when provided,
 // else from interpolated per-vertex PBR; dilates seams.
+// When `nsrc` is given, also bakes a normal map from the high-poly it names and
+// fills BakedMesh::nrm/vnrm/vtan. Only this unwrap path supports it; the box and
+// chart fallbacks bake albedo only.
 BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int32_t>& faces, int F,
-                  const std::vector<float>& pbr6, int texsize, const VoxelPbr* vox = nullptr);
+                  const std::vector<float>& pbr6, int texsize, const VoxelPbr* vox = nullptr,
+                  const NormalSrc* nsrc = nullptr);
 
 // Voxel-native box (cube) projection atlas — no xatlas, no chart computation. Faces are
 // assigned to the axis-aligned plane (of 6) along which they are visible, with a second-layer
