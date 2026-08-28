@@ -1,4 +1,5 @@
 #include "strip_interior.h"
+#include "tri_bvh.h"
 
 #include <algorithm>
 #include <cmath>
@@ -35,30 +36,83 @@ namespace trellis {
 
 namespace {
 
-// Conservative: mark every voxel in each triangle's bounding box. For the
-// sub-voxel triangles of a dense shell the box is the triangle to within a
-// cell, and over-marking only thickens the seal, which is the safe direction.
+// Exact triangle/cell overlap (separating-axis test), NOT the triangle's
+// bounding box.
+//
+// The box version marked up to 8 cells where a triangle touches 1 or 2 -- the
+// remesh's edges are ~0.83 mm against a 0.98 mm cell, so every triangle is
+// sub-cell and its box is 2x2x2. That fattened each wall until the two walls of
+// the 3.9 mm offset shell merged into one blob, which is why the depth
+// histogram never showed two populations, why no trough was ever found on a
+// two-sheet asset, and why no probe distance separates the walls. Over-marking
+// is safe for sealing and fatal for telling inside from outside.
+//
+// Still conservative -- a cell the triangle touches at all is marked -- so the
+// shell stays watertight and the flood cannot leak.
+bool tri_cell_overlap(const float bc[3], const float h[3],
+                      const float a[3], const float b[3], const float c[3]) {
+    float v0[3], v1[3], v2[3];
+    for (int k = 0; k < 3; ++k) { v0[k] = a[k]-bc[k]; v1[k] = b[k]-bc[k]; v2[k] = c[k]-bc[k]; }
+    float e0[3], e1[3], e2[3];
+    for (int k = 0; k < 3; ++k) { e0[k] = v1[k]-v0[k]; e1[k] = v2[k]-v1[k]; e2[k] = v0[k]-v2[k]; }
+
+    // Separated along `ax`? Project the triangle and the box and look for a gap.
+    auto sep = [&](const float ax[3]) -> bool {
+        const float p0 = ax[0]*v0[0] + ax[1]*v0[1] + ax[2]*v0[2];
+        const float p1 = ax[0]*v1[0] + ax[1]*v1[1] + ax[2]*v1[2];
+        const float p2 = ax[0]*v2[0] + ax[1]*v2[1] + ax[2]*v2[2];
+        const float mn = std::min(p0, std::min(p1, p2));
+        const float mx = std::max(p0, std::max(p1, p2));
+        const float rad = std::fabs(ax[0])*h[0] + std::fabs(ax[1])*h[1] + std::fabs(ax[2])*h[2];
+        return mn > rad || mx < -rad;
+    };
+
+    // the nine edge x box-axis cross products
+    const float* E[3] = { e0, e1, e2 };
+    for (int i = 0; i < 3; ++i) {
+        const float* e = E[i];
+        const float ax0[3] = { 0.f,   -e[2],  e[1] };
+        const float ax1[3] = { e[2],   0.f,  -e[0] };
+        const float ax2[3] = { -e[1],  e[0],  0.f  };
+        if (sep(ax0) || sep(ax1) || sep(ax2)) return false;
+    }
+    // the three box face normals
+    const float X[3] = {1,0,0}, Y[3] = {0,1,0}, Z[3] = {0,0,1};
+    if (sep(X) || sep(Y) || sep(Z)) return false;
+    // the triangle's own plane
+    const float n[3] = { e0[1]*e1[2]-e0[2]*e1[1],
+                         e0[2]*e1[0]-e0[0]*e1[2],
+                         e0[0]*e1[1]-e0[1]*e1[0] };
+    if (sep(n)) return false;
+    return true;
+}
+
 void voxelize(const std::vector<float>& verts, const std::vector<int32_t>& faces,
               const float org[3], float cell, int R, std::vector<uint8_t>& g) {
     const size_t F = faces.size() / 3;
     const float inv = 1.0f / cell;
+    const float h[3] = { 0.5f*cell, 0.5f*cell, 0.5f*cell };
     for (size_t f = 0; f < F; ++f) {
+        const float* A = &verts[3*(size_t)faces[3*f+0]];
+        const float* B = &verts[3*(size_t)faces[3*f+1]];
+        const float* C = &verts[3*(size_t)faces[3*f+2]];
         int lo[3], hi[3];
         for (int k = 0; k < 3; ++k) {
-            float a = verts[3*(size_t)faces[3*f+0]+k];
-            float b = verts[3*(size_t)faces[3*f+1]+k];
-            float c = verts[3*(size_t)faces[3*f+2]+k];
-            const float mn = std::min(a, std::min(b, c)), mx = std::max(a, std::max(b, c));
-            lo[k] = (int)std::floor((mn - org[k]) * inv);
-            hi[k] = (int)std::floor((mx - org[k]) * inv);
-            lo[k] = std::max(0, std::min(R-1, lo[k]));
-            hi[k] = std::max(0, std::min(R-1, hi[k]));
+            const float mn = std::min(A[k], std::min(B[k], C[k]));
+            const float mx = std::max(A[k], std::max(B[k], C[k]));
+            lo[k] = std::max(0, std::min(R-1, (int)std::floor((mn - org[k]) * inv)));
+            hi[k] = std::max(0, std::min(R-1, (int)std::floor((mx - org[k]) * inv)));
         }
         for (int z = lo[2]; z <= hi[2]; ++z)
-            for (int y = lo[1]; y <= hi[1]; ++y) {
-                uint8_t* row = &g[((size_t)z*R + y)*R];
-                for (int x = lo[0]; x <= hi[0]; ++x) row[x] = 1;   // solid
-            }
+            for (int y = lo[1]; y <= hi[1]; ++y)
+                for (int x = lo[0]; x <= hi[0]; ++x) {
+                    uint8_t& cellv = g[((size_t)z*R + y)*R + x];
+                    if (cellv == 1) continue;
+                    const float bc[3] = { org[0] + (x + 0.5f)*cell,
+                                          org[1] + (y + 0.5f)*cell,
+                                          org[2] + (z + 0.5f)*cell };
+                    if (tri_cell_overlap(bc, h, A, B, C)) cellv = 1;
+                }
     }
 }
 
@@ -222,6 +276,92 @@ int64_t strip_interior(std::vector<float>& verts, std::vector<int32_t>& faces,
         }
     }
 
+    std::vector<uint8_t> vis((size_t)F, 0);
+    int64_t seen = 0;
+
+    // ---- exterior-side classification (opt.outward) ---------------------
+    // Keep a face when the space on its front side is connected to infinity.
+    //
+    // That question is global, which is why no local test can answer it: an
+    // inner-wall face has empty space ahead of it too (the object's own
+    // interior), so locally it is indistinguishable from an outer-wall face.
+    // Only connectivity separates them, and connectivity is the flood fill.
+    //
+    // The flood must therefore not leak -- and at the mesh's own scale it does.
+    // Sealing this shell takes eight cells of dilation (measured: enclosed air
+    // 1 -> 62,359,268 between seal 4 and 8) while resolving its two walls, four
+    // cells apart, needs fewer than four. Both requirements scale with the cell,
+    // so no single resolution satisfies them.
+    //
+    // Run this classification at a COARSE grid instead. At a cell comparable to
+    // the shell thickness the shell is one solid cell thick and seals with no
+    // dilation at all, while the object's interior is many cells across and
+    // floods as a distinct region. Resolution is then no longer being asked to
+    // separate the two walls -- the probe direction does that.
+    if (opt.outward) {
+        auto is_ext = [&](const float p3[3]) -> bool {
+            int c3[3];
+            for (int k = 0; k < 3; ++k) {
+                c3[k] = (int)std::floor((p3[k] - org[k]) * invc);
+                if (c3[k] < 0 || c3[k] >= R) return true;   // beyond the grid is outside
+            }
+            return g[((size_t)c3[2]*R + c3[1])*R + c3[0]] == 2;
+        };
+        // Far enough to clear the shell, near enough to stay inside the cavity
+        // rather than punching out the other side of a thin feature.
+        const float d1 = 1.5f * cell;
+
+        auto face_geom = [&](int64_t f, float ctr[3], float nrm[3]) {
+            const float* A = &verts[3*(size_t)faces[3*f+0]];
+            const float* B = &verts[3*(size_t)faces[3*f+1]];
+            const float* C = &verts[3*(size_t)faces[3*f+2]];
+            for (int k = 0; k < 3; ++k) ctr[k] = (A[k] + B[k] + C[k]) / 3.f;
+            const float e1[3] = {B[0]-A[0], B[1]-A[1], B[2]-A[2]};
+            const float e2[3] = {C[0]-A[0], C[1]-A[1], C[2]-A[2]};
+            nrm[0] = e1[1]*e2[2]-e1[2]*e2[1];
+            nrm[1] = e1[2]*e2[0]-e1[0]*e2[2];
+            nrm[2] = e1[0]*e2[1]-e1[1]*e2[0];
+            const float l = std::sqrt(nrm[0]*nrm[0]+nrm[1]*nrm[1]+nrm[2]*nrm[2]);
+            if (l > 1e-20f) { for (int k = 0; k < 3; ++k) nrm[k] /= l; }
+            else { nrm[0] = 0.f; nrm[1] = 0.f; nrm[2] = 1.f; }
+        };
+
+        // clean_mesh unifies winding but has no notion of outward, so vote on it:
+        // with the correct sign the outer wall sees exterior ahead, with it
+        // flipped almost nothing does.
+        int64_t votes[2] = {0, 0};
+        const int64_t stride = F > 20000 ? F / 20000 : 1;
+        int64_t sampled = 0;
+        for (int64_t f = 0; f < F; f += stride) {
+            ++sampled;
+            float ctr[3], nrm[3];
+            face_geom(f, ctr, nrm);
+            for (int sg = 0; sg < 2; ++sg) {
+                const float m = sg ? -1.f : 1.f;
+                const float p1[3] = { ctr[0]+m*nrm[0]*d1, ctr[1]+m*nrm[1]*d1, ctr[2]+m*nrm[2]*d1 };
+                if (is_ext(p1)) ++votes[sg];
+            }
+        }
+        const float sgn = votes[1] > votes[0] ? -1.f : 1.f;
+        if (opt.verbose)
+            printf("  strip_interior: outward sign %+.0f (exterior ahead: +%lld / -%lld of %lld)\n",
+                   sgn, (long long)votes[0], (long long)votes[1], (long long)sampled);
+
+        for (int64_t f = 0; f < F; ++f) {
+            float ctr[3], nrm[3];
+            face_geom(f, ctr, nrm);
+            const float p1[3] = { ctr[0]+sgn*nrm[0]*d1, ctr[1]+sgn*nrm[1]*d1, ctr[2]+sgn*nrm[2]*d1 };
+            if (is_ext(p1)) { vis[(size_t)f] = 1; ++seen; }
+        }
+        if (opt.verbose)
+            printf("  strip_interior: exterior-side test keeps %lld/%lld faces (%.1f%%)\n",
+                   (long long)seen, (long long)F, 100.0 * (double)seen / (double)F);
+        if (seen == 0 || seen == F) {
+            if (opt.verbose) printf("  strip_interior: nothing to remove\n");
+            return 0;
+        }
+    } else {
+
     // Where to cut. The outer sheet and whatever lies under it show up as two
     // populations separated by a near-empty trough - the 2*eps gap, in cells.
     // Finding that trough per asset matters: measured troughs sit at depth 5 on
@@ -252,14 +392,13 @@ int64_t strip_interior(std::vector<float>& verts, std::vector<int32_t>& faces,
     }
 
     // Keep everything down to the chosen depth.
-    std::vector<uint8_t> vis((size_t)F, 0);
-    int64_t seen = 0;
     for (int64_t f = 0; f < F; ++f)
         if (fd[(size_t)f] <= cut) { vis[(size_t)f] = 1; ++seen; }
     if (opt.verbose)
         printf("  strip_interior: keeping depth <= %d -> %lld/%lld faces (%.1f%%)\n",
                cut, (long long)seen, (long long)F, 100.0 * (double)seen / (double)F);
     if (seen == 0) return 0;
+    }   // end of the trough path
 
     // Compact.
     std::vector<int32_t> remap((size_t)V, -1);

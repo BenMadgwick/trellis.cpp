@@ -29,6 +29,22 @@ struct StripOpts {
     int depth = -1;     // cells from the exterior to keep; -1 = find the trough
     int threads = 0;    // reserved
     bool verbose = true;
+    // Classify each face by which side of it is open, instead of thresholding a
+    // depth histogram.
+    //
+    // The histogram cannot see a two-sheet shell: its walls are 2*eps ~ 3.9 mm
+    // apart, four cells at 1024^3, and the seal dilation that stops the exterior
+    // flood leaking also fills that gap -- the detector must destroy the signal
+    // before it can read it. Worse, per-face depth is taken from the shallowest
+    // cell in the triangle's bounding box, so a large or diagonal triangle picks
+    // up cells nowhere near itself, and any threshold then cuts through the
+    // middle of the outer wall (measured: 821,183 boundary edges on a dog).
+    //
+    // The remesh is closed and consistently wound, so an outer-wall face's
+    // normal points into the exterior while an inner-wall face's points into the
+    // enclosed cavity. Probing a short way along the normal separates them
+    // exactly, per face, with no threshold and no histogram.
+    bool outward = false;
 };
 
 // Rewrites verts/faces in place, keeping only the faces that bound the
