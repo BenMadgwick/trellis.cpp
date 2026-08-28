@@ -1,5 +1,8 @@
 #include "strip_interior.h"
 #include "tri_bvh.h"
+#include <functional>
+#include <unordered_map>
+#include <algorithm>
 
 #include <algorithm>
 #include <cmath>
@@ -279,85 +282,154 @@ int64_t strip_interior(std::vector<float>& verts, std::vector<int32_t>& faces,
     std::vector<uint8_t> vis((size_t)F, 0);
     int64_t seen = 0;
 
-    // ---- exterior-side classification (opt.outward) ---------------------
-    // Keep a face when the space on its front side is connected to infinity.
+    // ---- side-of-input classification (opt.outward) ---------------------
+    // Ask which side of the ORIGINAL surface each face sits on.
     //
-    // That question is global, which is why no local test can answer it: an
-    // inner-wall face has empty space ahead of it too (the object's own
-    // interior), so locally it is indistinguishable from an outer-wall face.
-    // Only connectivity separates them, and connectivity is the flood fill.
+    // remesh_dc places every output vertex at distance eps from its input, so a
+    // face is either eps outside that input or eps inside it -- and the closest
+    // point on the input, with the input's own normal there, says which. One
+    // closest-point query per face, no grid, no flood, no min-cut.
     //
-    // The flood must therefore not leak -- and at the mesh's own scale it does.
-    // Sealing this shell takes eight cells of dilation (measured: enclosed air
-    // 1 -> 62,359,268 between seal 4 and 8) while resolving its two walls, four
-    // cells apart, needs fewer than four. Both requirements scale with the cell,
-    // so no single resolution satisfies them.
+    // This is the one question the failed approaches were all circling, and it
+    // is answerable only because the input is still available:
+    //   - depth-histogram trough: the seal needed against flood leaks (8 cells)
+    //     exceeds the wall separation (4 cells), and both scale with the cell.
+    //   - local probes / visibility rays: an inner-wall face has empty space
+    //     ahead of it too, so it is locally identical to an outer-wall face.
+    //   - ray parity / winding number, and libigl's outer_hull: by
+    //     Jordan-Brouwer a closed connected manifold has exactly two complement
+    //     components, and this mesh encloses only its own 2*eps band (measured
+    //     volume/area = eps). So the "cavity" IS the exterior, reached through
+    //     the tunnels where the bag folds around the input's holes. Nothing is
+    //     enclosed, and no connectivity method can separate what is not separate.
+    //   - connected components: one component, the walls join at those folds.
     //
-    // Run this classification at a COARSE grid instead. At a cell comparable to
-    // the shell thickness the shell is one solid cell thick and seals with no
-    // dilation at all, while the object's interior is many cells across and
-    // floods as a distinct region. Resolution is then no longer being asked to
-    // separate the two walls -- the probe direction does that.
+    // Depends on the input's winding being locally consistent, which for TRELLIS
+    // it is. A global flip is handled by the vote below.
     if (opt.outward) {
-        auto is_ext = [&](const float p3[3]) -> bool {
-            int c3[3];
-            for (int k = 0; k < 3; ++k) {
-                c3[k] = (int)std::floor((p3[k] - org[k]) * invc);
-                if (c3[k] < 0 || c3[k] >= R) return true;   // beyond the grid is outside
-            }
-            return g[((size_t)c3[2]*R + c3[1])*R + c3[0]] == 2;
-        };
-        // Far enough to clear the shell, near enough to stay inside the cavity
-        // rather than punching out the other side of a thin feature.
-        const float d1 = 1.5f * cell;
-
-        auto face_geom = [&](int64_t f, float ctr[3], float nrm[3]) {
+        if (!opt.ref_bvh || !opt.ref_verts || !opt.ref_faces || opt.ref_F <= 0) {
+            if (opt.verbose)
+                printf("  strip_interior: --strip-outward needs the pre-remesh mesh; skipping\n");
+            return 0;
+        }
+        auto side = [&](int64_t f, float& out_d) -> int {
             const float* A = &verts[3*(size_t)faces[3*f+0]];
             const float* B = &verts[3*(size_t)faces[3*f+1]];
             const float* C = &verts[3*(size_t)faces[3*f+2]];
-            for (int k = 0; k < 3; ++k) ctr[k] = (A[k] + B[k] + C[k]) / 3.f;
-            const float e1[3] = {B[0]-A[0], B[1]-A[1], B[2]-A[2]};
-            const float e2[3] = {C[0]-A[0], C[1]-A[1], C[2]-A[2]};
-            nrm[0] = e1[1]*e2[2]-e1[2]*e2[1];
-            nrm[1] = e1[2]*e2[0]-e1[0]*e2[2];
-            nrm[2] = e1[0]*e2[1]-e1[1]*e2[0];
-            const float l = std::sqrt(nrm[0]*nrm[0]+nrm[1]*nrm[1]+nrm[2]*nrm[2]);
-            if (l > 1e-20f) { for (int k = 0; k < 3; ++k) nrm[k] /= l; }
-            else { nrm[0] = 0.f; nrm[1] = 0.f; nrm[2] = 1.f; }
+            float c3[3];
+            for (int k = 0; k < 3; ++k) c3[k] = (A[k] + B[k] + C[k]) / 3.f;
+            const TriBvh::Hit h = opt.ref_bvh->closest(c3, 1e30f);
+            if (h.face < 0) { out_d = 0.f; return 0; }
+            const int32_t* rf = &opt.ref_faces[3*(size_t)h.face];
+            const float* P0 = &opt.ref_verts[3*(size_t)rf[0]];
+            const float* P1 = &opt.ref_verts[3*(size_t)rf[1]];
+            const float* P2 = &opt.ref_verts[3*(size_t)rf[2]];
+            const float e1[3] = {P1[0]-P0[0], P1[1]-P0[1], P1[2]-P0[2]};
+            const float e2[3] = {P2[0]-P0[0], P2[1]-P0[1], P2[2]-P0[2]};
+            const float n[3] = { e1[1]*e2[2]-e1[2]*e2[1],
+                                 e1[2]*e2[0]-e1[0]*e2[2],
+                                 e1[0]*e2[1]-e1[1]*e2[0] };
+            float d = 0.f;
+            for (int k = 0; k < 3; ++k) d += (c3[k] - h.point[k]) * n[k];
+            const float ln = std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+            out_d = ln > 1e-20f ? d / ln : 0.f;
+            return d > 0.f ? 1 : (d < 0.f ? -1 : 0);
         };
 
-        // clean_mesh unifies winding but has no notion of outward, so vote on it:
-        // with the correct sign the outer wall sees exterior ahead, with it
-        // flipped almost nothing does.
-        int64_t votes[2] = {0, 0};
-        const int64_t stride = F > 20000 ? F / 20000 : 1;
-        int64_t sampled = 0;
-        for (int64_t f = 0; f < F; f += stride) {
-            ++sampled;
-            float ctr[3], nrm[3];
-            face_geom(f, ctr, nrm);
-            for (int sg = 0; sg < 2; ++sg) {
-                const float m = sg ? -1.f : 1.f;
-                const float p1[3] = { ctr[0]+m*nrm[0]*d1, ctr[1]+m*nrm[1]*d1, ctr[2]+m*nrm[2]*d1 };
-                if (is_ext(p1)) ++votes[sg];
-            }
-        }
-        const float sgn = votes[1] > votes[0] ? -1.f : 1.f;
-        if (opt.verbose)
-            printf("  strip_interior: outward sign %+.0f (exterior ahead: +%lld / -%lld of %lld)\n",
-                   sgn, (long long)votes[0], (long long)votes[1], (long long)sampled);
-
+        // Global winding of the input could be flipped; the outer side is
+        // whichever holds the larger total area (the eps-outward offset of a
+        // closed-ish sheet is strictly the larger of the two).
+        double area_pos = 0.0, area_neg = 0.0;
+        std::vector<int8_t> sd((size_t)F, 0);
+        std::vector<float>  sdist((size_t)F, 0.f);
         for (int64_t f = 0; f < F; ++f) {
-            float ctr[3], nrm[3];
-            face_geom(f, ctr, nrm);
-            const float p1[3] = { ctr[0]+sgn*nrm[0]*d1, ctr[1]+sgn*nrm[1]*d1, ctr[2]+sgn*nrm[2]*d1 };
-            if (is_ext(p1)) { vis[(size_t)f] = 1; ++seen; }
+            float d = 0.f;
+            const int sgn = side(f, d);
+            sd[(size_t)f] = (int8_t)sgn;
+            sdist[(size_t)f] = d;
+            const float* A = &verts[3*(size_t)faces[3*f+0]];
+            const float* B = &verts[3*(size_t)faces[3*f+1]];
+            const float* C = &verts[3*(size_t)faces[3*f+2]];
+            const double u[3] = {B[0]-A[0], B[1]-A[1], B[2]-A[2]};
+            const double v[3] = {C[0]-A[0], C[1]-A[1], C[2]-A[2]};
+            const double cx = u[1]*v[2]-u[2]*v[1], cy = u[2]*v[0]-u[0]*v[2], cz = u[0]*v[1]-u[1]*v[0];
+            const double ar = 0.5 * std::sqrt(cx*cx + cy*cy + cz*cz);
+            if (sgn > 0) area_pos += ar; else if (sgn < 0) area_neg += ar;
         }
+        const int keep_sign = area_pos >= area_neg ? 1 : -1;
         if (opt.verbose)
-            printf("  strip_interior: exterior-side test keeps %lld/%lld faces (%.1f%%)\n",
+            printf("  strip_interior: side-of-input areas + %.1f cm2 / - %.1f cm2 -> keeping %s\n",
+                   area_pos * 1e4, area_neg * 1e4, keep_sign > 0 ? "+" : "-");
+
+        // The raw sign is globally right and locally noisy: near the fold, and
+        // wherever the closest-point query lands on a differently-oriented input
+        // triangle, it flips face to face. Thresholding it directly shreds the
+        // surface (measured: 1,973,145 boundary edges on a 3.87M-face half).
+        //
+        // Diffuse the signed distance over face adjacency and re-threshold. The
+        // distance carries confidence the bare sign throws away -- deep faces
+        // outvote ambiguous ones instead of merely outnumbering them -- so the
+        // label boundary relaxes onto the fold, which is where the two walls
+        // genuinely meet and the only place a cut costs nothing.
+        if (opt.smooth > 0) {
+            // face adjacency by shared edge, via a sorted edge list rather than
+            // a hash map: 23M entries at this scale.
+            std::vector<std::pair<uint64_t,int32_t>> ed;
+            ed.reserve((size_t)F * 3);
+            for (int64_t f = 0; f < F; ++f)
+                for (int j = 0; j < 3; ++j) {
+                    int32_t a = faces[3*f+j], b = faces[3*f+(j+1)%3];
+                    if (a > b) std::swap(a, b);
+                    ed.emplace_back(((uint64_t)(uint32_t)a << 32) | (uint32_t)b, (int32_t)f);
+                }
+            std::sort(ed.begin(), ed.end());
+            std::vector<int32_t> nbr_off((size_t)F + 1, 0), nbr;
+            nbr.reserve((size_t)F * 3);
+            {   // count then fill, so neighbours live in one flat array
+                std::vector<int32_t> cnt((size_t)F, 0);
+                for (size_t i = 0; i + 1 < ed.size(); ++i)
+                    if (ed[i].first == ed[i+1].first) { ++cnt[(size_t)ed[i].second]; ++cnt[(size_t)ed[i+1].second]; }
+                for (int64_t f = 0; f < F; ++f) nbr_off[(size_t)f+1] = nbr_off[(size_t)f] + cnt[(size_t)f];
+                nbr.assign((size_t)nbr_off[(size_t)F], -1);
+                std::vector<int32_t> fill((size_t)F, 0);
+                for (size_t i = 0; i + 1 < ed.size(); ++i)
+                    if (ed[i].first == ed[i+1].first) {
+                        const int32_t u = ed[i].second, v = ed[i+1].second;
+                        nbr[(size_t)nbr_off[(size_t)u] + fill[(size_t)u]++] = v;
+                        nbr[(size_t)nbr_off[(size_t)v] + fill[(size_t)v]++] = u;
+                    }
+            }
+            std::vector<float> cur = sdist, nxt((size_t)F);
+            for (int it = 0; it < opt.smooth; ++it) {
+                for (int64_t f = 0; f < F; ++f) {
+                    float acc = cur[(size_t)f];
+                    int n = 1;
+                    for (int32_t i = nbr_off[(size_t)f]; i < nbr_off[(size_t)f+1]; ++i) {
+                        acc += cur[(size_t)nbr[(size_t)i]];
+                        ++n;
+                    }
+                    nxt[(size_t)f] = acc / (float)n;
+                }
+                cur.swap(nxt);
+            }
+            int64_t flipped = 0;
+            for (int64_t f = 0; f < F; ++f) {
+                const int8_t ns = cur[(size_t)f] > 0.f ? 1 : (cur[(size_t)f] < 0.f ? -1 : 0);
+                if (ns != 0 && ns != sd[(size_t)f]) ++flipped;
+                if (ns != 0) sd[(size_t)f] = ns;
+            }
+            if (opt.verbose)
+                printf("  strip_interior: %d smoothing passes relabelled %lld faces (%.2f%%)\n",
+                       opt.smooth, (long long)flipped, 100.0 * (double)flipped / (double)F);
+        }
+
+        for (int64_t f = 0; f < F; ++f)
+            if (sd[(size_t)f] == keep_sign) { vis[(size_t)f] = 1; ++seen; }
+        if (opt.verbose)
+            printf("  strip_interior: side test keeps %lld/%lld faces (%.1f%%)\n",
                    (long long)seen, (long long)F, 100.0 * (double)seen / (double)F);
         if (seen == 0 || seen == F) {
-            if (opt.verbose) printf("  strip_interior: nothing to remove\n");
+            if (opt.verbose) printf("  strip_interior: nothing separable\n");
             return 0;
         }
     } else {

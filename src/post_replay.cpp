@@ -143,6 +143,7 @@ int main(int argc, char** argv) {
         else if (a == "--strip-depth" && i+1 < argc) strip.depth = atoi(argv[++i]);
         else if (a == "--strip-seal" && i+1 < argc) strip.seal = atoi(argv[++i]);
         else if (a == "--strip-outward") strip.outward = true;
+        else if (a == "--strip-smooth" && i+1 < argc) strip.smooth = atoi(argv[++i]);
         else if (a == "--save-mesh" && i+1 < argc) save_mesh = argv[++i];
         else if (a == "--load-mesh" && i+1 < argc) load_mesh = argv[++i];
         else if (a == "--save-stripped" && i+1 < argc) save_stripped = argv[++i];
@@ -240,6 +241,10 @@ int main(int argc, char** argv) {
     // about to spend its budget on can never be seen - and being crumpled, it
     // scores as high-curvature detail and outbids the smooth visible skin.
     if (do_strip && !pre_stripped) {
+        // The pre-remesh mesh and its BVH, which remesh_dc already built.
+        strip.ref_verts = verts.data(); strip.ref_faces = faces.data();
+        strip.ref_V = (int64_t)verts.size()/3; strip.ref_F = (int64_t)faces.size()/3;
+        strip.ref_bvh = &bvh;
         trellis::strip_interior(sverts, sfaces, strip);
         audit("strip_interior", sfaces);
         printf("  [strip %.1fs]\n", now()-t); t = now();

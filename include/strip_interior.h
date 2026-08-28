@@ -23,6 +23,8 @@
 
 namespace trellis {
 
+class TriBvh;
+
 struct StripOpts {
     int grid = 1024;    // voxel grid resolution for the exterior flood fill
     int seal = 1;       // dilations of the shell before flooding, to close leaks
@@ -45,6 +47,15 @@ struct StripOpts {
     // enclosed cavity. Probing a short way along the normal separates them
     // exactly, per face, with no threshold and no histogram.
     bool outward = false;
+    int  smooth = 8;    // diffusion passes over face adjacency before thresholding
+                        //   the side-of-input sign; 0 uses the raw sign
+    // The PRE-remesh mesh and a BVH over it, for the outward test below.
+    // remesh_dc already builds exactly this to evaluate its UDF, so passing it
+    // here costs nothing.
+    const float*   ref_verts = nullptr;
+    const int32_t* ref_faces = nullptr;
+    int64_t        ref_V = 0, ref_F = 0;
+    const TriBvh*  ref_bvh = nullptr;
 };
 
 // Rewrites verts/faces in place, keeping only the faces that bound the
