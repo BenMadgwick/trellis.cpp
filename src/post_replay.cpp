@@ -107,6 +107,18 @@ int main(int argc, char** argv) {
     const char* save_mesh = nullptr; const char* load_mesh = nullptr;
     const char* save_stripped = nullptr; const char* load_stripped = nullptr;
     bool signed_remesh = false;
+    // Contouring grid resolution, independent of the dump's own res. The UDF is
+    // evaluated from the mesh through a BVH, so a finer grid is simply more
+    // samples of the same field -- and thin features are lost when the region
+    // between two surfaces is thinner than a cell, which is the suspected cause
+    // of the tearing on hollow reconstructions.
+    int remesh_res = 0;
+    // Largest boundary loop fill_small_holes will close. The default of 64 is
+    // fine for the unsigned path, which never asks what is inside; ray parity
+    // does, and a ray that escapes through a surviving hole miscounts. Input
+    // boundary edges track the tearing almost exactly: dog 3,756 -> 0.2 open
+    // edges per 1000 faces, table 121,631 -> 9.9, jerry can 128,213 -> 17.1.
+    int fill_loop = 64;
     bool do_normal = false, nrm_tangent = true;
     float nrm_search = 2.0f;
     float nrm_min_dot = 0.85f;
@@ -141,6 +153,8 @@ int main(int argc, char** argv) {
         else if (a == "--band" && i+1 < argc) band = atoi(argv[++i]);
         else if (a == "--no-snap") do_snap = false;
         else if (a == "--signed-remesh") signed_remesh = true;
+        else if (a == "--remesh-res" && i+1 < argc) remesh_res = atoi(argv[++i]);
+        else if (a == "--fill-loop" && i+1 < argc) fill_loop = atoi(argv[++i]);
         else if (a == "--strip-interior") do_strip = true;
         else if (a == "--strip-grid" && i+1 < argc) strip.grid = atoi(argv[++i]);
         else if (a == "--strip-depth" && i+1 < argc) strip.depth = atoi(argv[++i]);
@@ -226,7 +240,7 @@ int main(int argc, char** argv) {
     if (do_weld) trellis::weld_vertices(verts, faces, nullptr, 1.0f / ((float)res * 8.0f));
     printf("  [weld %.1fs]\n", now()-t); t = now();
     audit("weld", faces);
-    if (do_fill) trellis::fill_small_holes(faces);
+    if (do_fill) trellis::fill_small_holes(faces, fill_loop);
     printf("  [fill %.1fs]\n", now()-t); t = now();
     audit("fill_small_holes", faces);
 
@@ -247,8 +261,10 @@ int main(int argc, char** argv) {
     }
     if (!cached && load_mesh) cached = load_mesh_bin(load_mesh, rm.verts, rm.faces, "post-remesh");
     if (do_remesh && !cached) {
+        const int rres = remesh_res > 0 ? remesh_res : res;
+        if (rres != res) printf("  remesh at grid %d (dump res %d)\n", rres, res);
         rm = trellis::remesh_narrow_band_dc(verts.data(), (int64_t)verts.size()/3,
-                                            faces.data(), (int64_t)faces.size()/3, bvh, res, band,
+                                            faces.data(), (int64_t)faces.size()/3, bvh, rres, band,
                                             0.0f, signed_remesh);
         printf("  [remesh %.1fs]\n", now()-t); t = now();
         audit("remesh", rm.faces);
