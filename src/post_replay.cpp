@@ -17,6 +17,7 @@
 #include "mesh_glb.h"
 #include <chrono>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -105,6 +106,7 @@ int main(int argc, char** argv) {
     std::vector<int> targets;
     const char* save_mesh = nullptr; const char* load_mesh = nullptr;
     const char* save_stripped = nullptr; const char* load_stripped = nullptr;
+    bool signed_remesh = false;
     bool do_normal = false, nrm_tangent = true;
     float nrm_search = 2.0f;
     float nrm_min_dot = 0.85f;
@@ -138,6 +140,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-remesh") do_remesh = false;
         else if (a == "--band" && i+1 < argc) band = atoi(argv[++i]);
         else if (a == "--no-snap") do_snap = false;
+        else if (a == "--signed-remesh") signed_remesh = true;
         else if (a == "--strip-interior") do_strip = true;
         else if (a == "--strip-grid" && i+1 < argc) strip.grid = atoi(argv[++i]);
         else if (a == "--strip-depth" && i+1 < argc) strip.depth = atoi(argv[++i]);
@@ -164,9 +167,10 @@ int main(int argc, char** argv) {
     // A normal bake against the unstripped shell samples buried, inward-facing
     // sheets over most of the surface; the result is noise that looks plausible
     // in the texture viewer. Refuse rather than produce it.
-    if (do_normal && !do_strip && !load_stripped) {
+    if (do_normal && !do_strip && !load_stripped && !signed_remesh) {
         fprintf(stderr, "--normal-map requires --strip-interior (or --load-stripped): baking against\n"
-                        "the four-sheet shell samples buried geometry and yields noise.\n");
+                        "the four-sheet shell samples buried geometry and yields noise.\n"
+                        "--signed-remesh also satisfies this: it never builds the cover.\n");
         return 1;
     }
 
@@ -195,6 +199,28 @@ int main(int argc, char** argv) {
     if (fread(pbr6.data(),4,pbr6.size(),f) != pbr6.size()) { fprintf(stderr, "%s: short read (pbr)\n", dump); fclose(f); return 1; }
     fclose(f);
     printf("loaded: V=%d F=%d voxels=%d res=%d\n", V, F, Mv, res);
+    {
+        // Volume/area of the INPUT, before any remeshing. Says whether the
+        // decoded mesh is already two-walled (ratio ~ half the wall separation)
+        // or a genuine single sheet (ratio ~ 0). That decides whether the
+        // double cover is created by the decode or entirely by remesh_dc.
+        double vol = 0.0, area = 0.0;
+        for (int64_t f = 0; f < (int64_t)F; ++f) {
+            const float* A = &verts[3*(size_t)faces[3*f+0]];
+            const float* B = &verts[3*(size_t)faces[3*f+1]];
+            const float* C = &verts[3*(size_t)faces[3*f+2]];
+            vol += ((double)A[0]*((double)B[1]*C[2] - (double)B[2]*C[1])
+                  - (double)A[1]*((double)B[0]*C[2] - (double)B[2]*C[0])
+                  + (double)A[2]*((double)B[0]*C[1] - (double)B[1]*C[0])) / 6.0;
+            const double u[3] = {B[0]-A[0], B[1]-A[1], B[2]-A[2]};
+            const double v2[3] = {C[0]-A[0], C[1]-A[1], C[2]-A[2]};
+            const double cx = u[1]*v2[2]-u[2]*v2[1], cy = u[2]*v2[0]-u[0]*v2[2], cz = u[0]*v2[1]-u[1]*v2[0];
+            area += 0.5 * std::sqrt(cx*cx + cy*cy + cz*cz);
+        }
+        printf("  [input] signed volume %.2f cm3, area %.1f cm2, vol/area %.4f mm\n",
+               vol * 1e6, area * 1e4, (area > 0 ? std::fabs(vol)/area : 0.0) * 1000.0);
+        fflush(stdout);
+    }
 
     double t = now();
     if (do_weld) trellis::weld_vertices(verts, faces, nullptr, 1.0f / ((float)res * 8.0f));
@@ -222,7 +248,8 @@ int main(int argc, char** argv) {
     if (!cached && load_mesh) cached = load_mesh_bin(load_mesh, rm.verts, rm.faces, "post-remesh");
     if (do_remesh && !cached) {
         rm = trellis::remesh_narrow_band_dc(verts.data(), (int64_t)verts.size()/3,
-                                            faces.data(), (int64_t)faces.size()/3, bvh, res, band);
+                                            faces.data(), (int64_t)faces.size()/3, bvh, res, band,
+                                            0.0f, signed_remesh);
         printf("  [remesh %.1fs]\n", now()-t); t = now();
         audit("remesh", rm.faces);
         // match the CLI: clean degenerates/unify winding, drop floater components

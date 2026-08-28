@@ -44,9 +44,127 @@ void parallel_for(int64_t n, const std::function<void(int64_t, int64_t)>& fn) {
 
 }  // namespace
 
+namespace {
+
+// Angle-weighted pseudonormals (Baerentzen & Aanaes). The sign of a distance is
+// only well defined against the right normal: at a vertex or an edge, the normal
+// of whichever triangle the query happened to land on gives the wrong answer in
+// concave regions -- and the closest point lands on a feature constantly here,
+// because the triangles (~0.8 mm) are smaller than the grid cell (~1 mm).
+struct PseudoNormals {
+    std::vector<float> vn;   // [V*3], angle-weighted
+
+    void build(const float* verts, int64_t V, const int32_t* faces, int64_t F) {
+        vn.assign((size_t)V * 3, 0.f);
+        for (int64_t f = 0; f < F; ++f) {
+            const int32_t i0 = faces[3*f], i1 = faces[3*f+1], i2 = faces[3*f+2];
+            const float* P[3] = { &verts[3*(size_t)i0], &verts[3*(size_t)i1], &verts[3*(size_t)i2] };
+            const float e1[3] = {P[1][0]-P[0][0], P[1][1]-P[0][1], P[1][2]-P[0][2]};
+            const float e2[3] = {P[2][0]-P[0][0], P[2][1]-P[0][1], P[2][2]-P[0][2]};
+            float n[3] = { e1[1]*e2[2]-e1[2]*e2[1],
+                           e1[2]*e2[0]-e1[0]*e2[2],
+                           e1[0]*e2[1]-e1[1]*e2[0] };
+            const float ln = std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+            if (ln <= 1e-30f) continue;
+            for (int k = 0; k < 3; ++k) n[k] /= ln;
+            const int32_t idx[3] = { i0, i1, i2 };
+            for (int c = 0; c < 3; ++c) {
+                const float* A = P[c];
+                const float* B = P[(c+1)%3];
+                const float* C = P[(c+2)%3];
+                float u[3], v[3];
+                for (int k = 0; k < 3; ++k) { u[k] = B[k]-A[k]; v[k] = C[k]-A[k]; }
+                const float lu = std::sqrt(u[0]*u[0]+u[1]*u[1]+u[2]*u[2]);
+                const float lv = std::sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]);
+                if (lu <= 1e-30f || lv <= 1e-30f) continue;
+                float d = (u[0]*v[0]+u[1]*v[1]+u[2]*v[2]) / (lu*lv);
+                d = std::max(-1.f, std::min(1.f, d));
+                const float w = std::acos(d);          // interior angle at this corner
+                for (int k = 0; k < 3; ++k) vn[3*(size_t)idx[c]+k] += w * n[k];
+            }
+        }
+        for (int64_t v = 0; v < V; ++v) {
+            float* n = &vn[3*(size_t)v];
+            const float l = std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+            if (l > 1e-30f) { for (int k = 0; k < 3; ++k) n[k] /= l; }
+        }
+    }
+
+    // +1 outside, -1 inside by RAY PARITY: march to infinity and count crossings,
+    // odd meaning inside. Exact for a closed region and, unlike a pseudonormal,
+    // indifferent to how the surface is wound locally -- which matters because
+    // this input carries 22,641 non-manifold edges against only 3,756 boundary
+    // edges, so it is topologically messy far more than it is open.
+    //
+    // The direction is deliberately not axis-aligned: an axis ray through a
+    // dense axis-aligned-ish mesh grazes edges constantly, and every graze is a
+    // miscount.
+    static float parity_sign(const TriBvh& bvh, const float p[3], float reach) {
+        // Five directions, majority wins. A single ray is hostage to whatever it
+        // happens to graze: on the dog it miscounted across the whole of the
+        // back, where the surface lies near-tangent to one direction, and the
+        // result was a hole along the spine. Grazing is direction-specific, so
+        // independent directions disagree only where one of them is wrong.
+        static const float D[5][3] = {
+            {  0.5773503f,  0.5774085f,  0.5772921f },
+            { -0.7071068f,  0.4082483f,  0.5773503f },
+            {  0.3363364f, -0.8451543f,  0.4140393f },
+            {  0.2672612f,  0.5345225f, -0.8017837f },
+            { -0.4558423f, -0.5698029f, -0.6837635f },
+        };
+        int inside = 0;
+        for (int d = 0; d < 5; ++d) {
+            float org[3] = { p[0], p[1], p[2] };
+            float left = reach;
+            int crossings = 0;
+            for (int i = 0; i < 64; ++i) {
+                const TriBvh::RayHit h = bvh.ray(org, D[d], left);
+                if (h.face < 0) break;
+                ++crossings;
+                // Step just past the hit. Too small and the same triangle is hit
+                // again; too large and a thin wall is stepped over.
+                const float t = h.t + 1e-6f;
+                for (int k = 0; k < 3; ++k) org[k] += D[d][k] * t;
+                left -= t;
+                if (left <= 0.f) break;
+            }
+            if (crossings & 1) ++inside;
+        }
+        return inside >= 3 ? -1.f : 1.f;
+    }
+
+    // +1 outside, -1 inside, from the pseudonormal interpolated at the hit point.
+    float sign_at(const float* verts, const int32_t* faces,
+                  int32_t face, const float hp[3], const float p[3]) const {
+        const int32_t i0 = faces[3*face], i1 = faces[3*face+1], i2 = faces[3*face+2];
+        const float* A = &verts[3*(size_t)i0];
+        const float* B = &verts[3*(size_t)i1];
+        const float* C = &verts[3*(size_t)i2];
+        float v0[3], v1[3], v2[3];
+        for (int k = 0; k < 3; ++k) { v0[k] = B[k]-A[k]; v1[k] = C[k]-A[k]; v2[k] = hp[k]-A[k]; }
+        const float d00 = v0[0]*v0[0]+v0[1]*v0[1]+v0[2]*v0[2];
+        const float d01 = v0[0]*v1[0]+v0[1]*v1[1]+v0[2]*v1[2];
+        const float d11 = v1[0]*v1[0]+v1[1]*v1[1]+v1[2]*v1[2];
+        const float d20 = v2[0]*v0[0]+v2[1]*v0[1]+v2[2]*v0[2];
+        const float d21 = v2[0]*v1[0]+v2[1]*v1[1]+v2[2]*v1[2];
+        const float den = d00*d11 - d01*d01;
+        float b1 = 0.f, b2 = 0.f;
+        if (std::fabs(den) > 1e-30f) { b1 = (d11*d20 - d01*d21)/den; b2 = (d00*d21 - d01*d20)/den; }
+        const float b0 = 1.f - b1 - b2;
+        float n[3];
+        for (int k = 0; k < 3; ++k)
+            n[k] = b0*vn[3*(size_t)i0+k] + b1*vn[3*(size_t)i1+k] + b2*vn[3*(size_t)i2+k];
+        float dot = 0.f;
+        for (int k = 0; k < 3; ++k) dot += (p[k] - hp[k]) * n[k];
+        return dot >= 0.f ? 1.f : -1.f;
+    }
+};
+
+}  // namespace
+
 Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* ifaces, int64_t iF,
-                           const TriBvh& bvh, int res, int band, float project_back) {
-    (void)iV;
+                           const TriBvh& bvh, int res, int band, float project_back,
+                           bool signed_field) {
     Mesh out;
     if (iF == 0 || bvh.empty() || res <= 0) return out;
 
@@ -55,6 +173,11 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
     const float scale = (float)(res + 3 * band) / (float)res;
     const float cell = scale / (float)res;
     const float eps = (float)band * cell;
+    // Signed mode contours the zero level set; the band still sizes the active
+    // region, it just no longer offsets the surface.
+    const float lvl = signed_field ? 0.f : eps;
+    PseudoNormals pn;
+    if (signed_field) pn.build(iverts, iV, ifaces, iF);
     const float keep = 0.87f * cell;
 
     // Candidate cells: conservative dilation of every triangle's AABB by the
@@ -136,9 +259,9 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                 const float p[3] = { ((x + 0.5f) / res - 0.5f) * scale,
                                      ((y + 0.5f) / res - 0.5f) * scale,
                                      ((z + 0.5f) / res - 0.5f) * scale };
-                const TriBvh::Hit h = bvh.closest(p, eps + keep);
+                const TriBvh::Hit h = bvh.closest(p, lvl + keep);
                 if (h.face < 0) continue;
-                const float f = std::sqrt(h.dist2) - eps;
+                const float f = std::sqrt(h.dist2) - lvl;
                 if (std::fabs(f) < keep) act[i] = 1;
             }
         });
@@ -182,8 +305,18 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
             // Crossing edges always have their far endpoint under eps+cell
             // (f changes at most one cell-length per edge), so this bound
             // never clips a value that feeds the crossing interpolation.
-            const TriBvh::Hit h = bvh.closest(p, eps + 2 * cell);
-            fvert[i] = (h.face >= 0 ? std::sqrt(h.dist2) : eps + 2 * cell) - eps;
+            const TriBvh::Hit h = bvh.closest(p, lvl + 2 * cell);
+            if (h.face < 0) {
+                // Past the search radius. Active cells hug the surface and their
+                // corners sit within a cell of it, so this is the far field:
+                // positive either way.
+                fvert[i] = 2 * cell;
+            } else {
+                const float d = std::sqrt(h.dist2) - lvl;
+                fvert[i] = signed_field
+                    ? d * PseudoNormals::parity_sign(bvh, p, 4.0f * scale)
+                    : d;
+            }
         }
     });
     auto fval = [&](int x, int y, int z) -> float {
@@ -290,7 +423,7 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                 const float p[3] = {v[0], v[1], v[2]};
                 // Vertices sit on the eps shell, so the surface is ~eps away; the
                 // same bound the field pass uses is comfortably sufficient.
-                const TriBvh::Hit h = bvh.closest(p, eps + 2 * cell);
+                const TriBvh::Hit h = bvh.closest(p, lvl + 2 * cell);
                 if (h.face < 0) { ++local; continue; }   // no hit in range: leave as-is
                 for (int k = 0; k < 3; ++k) v[k] = p[k] - project_back * (p[k] - h.point[k]);
             }
@@ -301,8 +434,9 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                    project_back, (long long)missed.load(), (long long)NV);
     }
 
-    printf("  remesh_dc: %lld active voxels -> V=%d F=%d (eps=%.4g, project_back=%.2f)\n",
-           (long long)Na, out.V(), out.F(), eps, project_back);
+    printf("  remesh_dc: %lld active voxels -> V=%d F=%d (%s=%.4g, project_back=%.2f)\n",
+           (long long)Na, out.V(), out.F(), signed_field ? "SIGNED lvl" : "eps",
+           lvl, project_back);
     fflush(stdout);
     return out;
 }
