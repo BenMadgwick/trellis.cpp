@@ -464,6 +464,13 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             nsrc.bvh = &hi_bvh;
             nsrc.tangent_space = true;
             nsrc.search_scale = cfg.normal_search;
+            nsrc.min_consensus = cfg.normal_min_dot;
+            {
+                const float sc = (so.res + 3.f * remesh_band) / (float)so.res;
+                const float eps = remesh_band * sc / (float)so.res;
+                if (cfg.normal_cap_shells > 0.f)
+                    nsrc.search_cap = cfg.normal_cap_shells * 2.f * eps;
+            }
         }
 
         trellis::BakedMesh bm = boxuv ? trellis::uv_box_project(dv, dV, df, dF, no_vp, T, &vox)

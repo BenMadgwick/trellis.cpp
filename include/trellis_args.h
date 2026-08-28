@@ -51,6 +51,11 @@ struct TrellisParams {
                                 //   inward-facing geometry and returns noise.
     float normal_search = 2.0f; // ray/closest-point bound, in multiples of the local
                                 //   low-poly edge length (scales with the face target)
+    float normal_cap_shells = 4.0f; // ceiling on the normal-bake search, in offset
+                                //   shell thicknesses (2*eps); 0 = uncapped
+    float normal_min_dot = 0.85f; // abandon the normal bake below this winding
+                                //   consensus; --strip-interior running is not
+                                //   evidence that it removed anything. 0 disables.
     int  decim    = -1;         // decimation cluster grid   (-1 => per-cascade default)
     int  tex      = -1;         // UV atlas size in px        (-1 => per-cascade default)
     int  tex_res  = -1;         // texture PBR resolution: -1 => auto (drop dense res-1024 tex to

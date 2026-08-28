@@ -107,6 +107,11 @@ int main(int argc, char** argv) {
     const char* save_stripped = nullptr; const char* load_stripped = nullptr;
     bool do_normal = false, nrm_tangent = true;
     float nrm_search = 2.0f;
+    float nrm_min_dot = 0.85f;
+    // Search ceiling as a multiple of the offset shell's own thickness (2*eps).
+    // Expressed in shell thicknesses because that is the thing being tunnelled
+    // through, and it is known exactly rather than guessed.
+    float nrm_cap_shells = 4.0f;
     for (int i = 3; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--box-uv") boxuv = true;
@@ -144,6 +149,8 @@ int main(int argc, char** argv) {
         else if (a == "--normal-map") do_normal = true;
         else if (a == "--normal-space" && i+1 < argc) nrm_tangent = std::string(argv[++i]) != "object";
         else if (a == "--normal-search" && i+1 < argc) nrm_search = (float)atof(argv[++i]);
+        else if (a == "--normal-min-dot" && i+1 < argc) nrm_min_dot = (float)atof(argv[++i]);
+        else if (a == "--normal-cap-shells" && i+1 < argc) nrm_cap_shells = (float)atof(argv[++i]);
     }
 
     if (targets.empty()) targets.push_back(300000);
@@ -281,6 +288,15 @@ int main(int argc, char** argv) {
         nsrc.bvh = &hi_bvh;
         nsrc.tangent_space = nrm_tangent;
         nsrc.search_scale = nrm_search;
+        nsrc.min_consensus = nrm_min_dot;
+        // eps = band*scale/res with scale = (res + 3*band)/res -- the same
+        // expression remesh_dc uses, so the ceiling tracks whatever band the
+        // run actually used rather than assuming the default.
+        {
+            const float scale = (res + 3.f * band) / (float)res;
+            const float eps = band * scale / (float)res;
+            if (nrm_cap_shells > 0.f) nsrc.search_cap = nrm_cap_shells * 2.f * eps;
+        }
     }
 
     int failures = 0;

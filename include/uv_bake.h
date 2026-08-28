@@ -52,6 +52,29 @@ struct NormalSrc {
     // Decimation error scales with triangle size, so a per-texel bound tracks
     // drift across face targets instead of needing a retune at every tier.
     float search_scale = 2.0f;
+    // Absolute ceiling on that bound, in world units (TRELLIS space is a 1 m
+    // cube). 0 disables it.
+    //
+    // Edge length alone is not enough. remesh_dc wraps the input in an offset
+    // shell only 2*eps (~3.9 mm at res 1024) thick, so EVERY texel has a back
+    // wall just behind it, and at a 1 K budget 2x the edge length is tens of
+    // millimetres -- the search reaches through the shell and out the far side
+    // of the object. Backface rejection cannot catch that: the far side's INNER
+    // wall faces the same way as the near side's outer wall, so it passes.
+    // Measured on the dog at 1 K, accepted hits ran to 200 mm on a 1 m animal
+    // while genuine decimation drift was 10 mm at p90. The ceiling keeps the
+    // drift and discards the tunnelling.
+    float search_cap = 0.0f;
+    // Abandon the bake if the winding consensus falls below this. Passing
+    // --strip-interior proves only that the strip RAN, not that it removed
+    // anything: trough detection returns a no-op on most assets, and on one
+    // (the hat) it cut 12% and left the sheets in place. With sheets still
+    // present the bake is fine while the low-poly hugs the outer skin and
+    // degrades as the search bound grows with triangle size -- measured 0.999
+    // at 300K falling to 0.137 at 1K on an unstripped dog, against 0.936 on the
+    // properly stripped bear. The consensus dot is the only signal that knows
+    // the difference, so it is the gate. 0 disables the check.
+    float min_consensus = 0.85f;
     bool ok() const { return verts && faces && vnrm && bvh && F > 0; }
 };
 

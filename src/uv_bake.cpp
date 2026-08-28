@@ -106,7 +106,8 @@ struct VoxSampler {
 // coverage where it does not, with no cage geometry to build.
 struct NormalSampler {
     const NormalSrc& src;
-    float sign = 1.f;   // global winding sign, resolved against the low-poly
+    float sign = 1.f;        // global winding sign, resolved against the low-poly
+    float consensus = 0.f;   // |mean dot| -- how well the two normal fields agree
 
     explicit NormalSampler(const NormalSrc& s) : src(s) {}
 
@@ -148,15 +149,39 @@ struct NormalSampler {
     // not a measurement -- and left in, it is the black-speck artefact all over
     // again, now baked into the texture where no geometry fix can reach it.
     bool sample_raw(const float p[3], const float n_lo[3], float bound, float out[3],
-                    bool reject_back, float sgn) const {
+                    bool reject_back, float sgn, float* out_dist = nullptr) const {
         struct Cand { float t; int32_t face; float pt[3]; };
         Cand c[3]; int nc = 0;
-        for (int s = 0; s < 2; ++s) {
-            const float d[3] = { s ? -n_lo[0] : n_lo[0], s ? -n_lo[1] : n_lo[1], s ? -n_lo[2] : n_lo[2] };
-            const TriBvh::RayHit h = src.bvh->ray(p, d, bound);
+
+        // Cast from OUTSIDE the surface inward, not outward from the texel.
+        // Starting at p + n*bound and travelling along -n, the first triangle
+        // met is by construction the outermost one on that line -- which is the
+        // visible skin. Casting outward from p instead returns the nearest
+        // surface in either direction, and "nearest" is not "visible": inside
+        // the offset shell the back wall is nearer, and past it the far side of
+        // the object presents an inner wall whose normal agrees with n_lo and so
+        // survives backface rejection. This is the cheapest form of the cage a
+        // normal baker normally builds, and it removes the failure by geometry
+        // rather than by tuning a threshold.
+        {
+            const float org[3] = { p[0] + n_lo[0]*bound, p[1] + n_lo[1]*bound, p[2] + n_lo[2]*bound };
+            const float dir[3] = { -n_lo[0], -n_lo[1], -n_lo[2] };
+            const TriBvh::RayHit h = src.bvh->ray(org, dir, 2.f * bound);
+            if (h.face >= 0) {
+                c[nc].t = std::fabs(h.t - bound);   // distance from the texel, not the cage
+                c[nc].face = h.face;
+                for (int k = 0; k < 3; ++k) c[nc].pt[k] = org[k] + dir[k]*h.t;
+                ++nc;
+            }
+        }
+        // Outward as a second chance: where the low-poly sits proud of the
+        // high-poly by more than `bound`, the inward cast starts past the
+        // surface and misses it entirely.
+        {
+            const TriBvh::RayHit h = src.bvh->ray(p, n_lo, bound);
             if (h.face >= 0) {
                 c[nc].t = h.t; c[nc].face = h.face;
-                for (int k = 0; k < 3; ++k) c[nc].pt[k] = p[k] + d[k]*h.t;
+                for (int k = 0; k < 3; ++k) c[nc].pt[k] = p[k] + n_lo[k]*h.t;
                 ++nc;
             }
         }
@@ -167,16 +192,21 @@ struct NormalSampler {
             ++nc;
         }
         if (!nc) return false;
-        // nearest first: the ray hits usually beat the closest point, but where
-        // a ray has punched through a hole the closest point is the better guess
-        int ord[3] = {0,1,2};
-        for (int i = 1; i < nc; ++i)
-            for (int j = i; j > 0 && c[ord[j]].t < c[ord[j-1]].t; --j) { const int tmp=ord[j]; ord[j]=ord[j-1]; ord[j-1]=tmp; }
+        // Insertion order IS the preference order: cage cast, then the outward
+        // ray, then the closest point. Sorting by distance would let the closest
+        // point outrank the cage hit, and "nearest" is exactly the wrong rule --
+        // inside the offset shell the nearest surface is the back wall.
         for (int i = 0; i < nc; ++i) {
-            const Cand& k = c[ord[i]];
+            const Cand& k = c[i];
             normal_at(k.face, k.pt, out);
-            if (!reject_back) return true;
-            if (sgn*(out[0]*n_lo[0] + out[1]*n_lo[1] + out[2]*n_lo[2]) > 0.f) return true;
+            if (!reject_back || sgn*(out[0]*n_lo[0] + out[1]*n_lo[1] + out[2]*n_lo[2]) > 0.f) {
+                if (out_dist) {
+                    float d2 = 0.f;
+                    for (int a = 0; a < 3; ++a) { const float e = k.pt[a] - p[a]; d2 += e*e; }
+                    *out_dist = std::sqrt(d2);
+                }
+                return true;
+            }
         }
         return false;
     }
@@ -204,11 +234,14 @@ struct NormalSampler {
             const float edge = std::sqrt(std::max(e0[0]*e0[0]+e0[1]*e0[1]+e0[2]*e0[2],
                                                   e1[0]*e1[0]+e1[1]*e1[1]+e1[2]*e1[2]));
             float hi[3];
-            if (!sample_raw(c, n, std::max(edge * src.search_scale, 1e-4f), hi, false, 1.f)) continue;
+            float b = edge * src.search_scale;
+            if (src.search_cap > 0.f) b = std::min(b, src.search_cap);
+            if (!sample_raw(c, n, std::max(b, 1e-4f), hi, true, 1.f)) continue;
             acc += n[0]*hi[0] + n[1]*hi[1] + n[2]*hi[2];
             ++used;
         }
         sign = (used > 0 && acc < 0.0) ? -1.f : 1.f;
+        consensus = used ? (float)std::fabs(acc / used) : 0.f;
         printf("  normal_bake: winding consensus over %d faces -> sign %+.0f (mean dot %.3f)\n",
                used, sign, used ? (float)(acc/used) : 0.f);
         fflush(stdout);
@@ -1569,10 +1602,31 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
                 for (int k = 0; k < 3; ++k) { const float e = out.verts[3*a+k]-out.verts[3*b+k]; d += e*e; }
                 m = std::max(m, d);
             }
-            face_bound[f] = std::max(std::sqrt(m) * nsrc->search_scale, 1e-4f);
+            float b = std::sqrt(m) * nsrc->search_scale;
+            if (nsrc->search_cap > 0.f) b = std::min(b, nsrc->search_cap);
+            face_bound[f] = std::max(b, 1e-4f);
         }
+        if (nsrc->search_cap > 0.f)
+            printf("  normal_bake: search bound = min(%.1f x edge, %.1fmm)\n",
+                   nsrc->search_scale, nsrc->search_cap * 1000.f);
         ns.reset(new NormalSampler(*nsrc));
         ns->resolve_sign(out.verts, out.faces, out.vnrm, FoAll);
+        if (nsrc->min_consensus > 0.f && ns->consensus < nsrc->min_consensus) {
+            // Shipping this would be worse than shipping nothing: a wrong normal
+            // map is applied confidently by every renderer, and unlike missing
+            // geometry there is no visual cue that it is wrong.
+            printf("  normal_bake: ABANDONED - consensus %.3f is below %.3f, so the bake is\n"
+                   "               reading buried geometry rather than the visible surface.\n"
+                   "               The strip did not remove the buried sheets for this asset\n"
+                   "               (passing --strip-interior does not guarantee it removed any).\n"
+                   "               Shipping the GLB without a normal map.\n",
+                   ns->consensus, nsrc->min_consensus);
+            fflush(stdout);
+            ns.reset();
+            out.nrm.clear();
+            out.vtan.clear();
+            nmask.clear();
+        }
     }
 
     // --- rasterize into the atlas ---
@@ -1585,6 +1639,7 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     // near zero everywhere there is nothing to bake, and the histogram says so
     // before anyone renders anything.
     std::vector<uint32_t> devhist(181, 0);
+    std::vector<uint32_t> disthist(201, 0);
     size_t nrm_hits = 0, nrm_miss = 0;
     auto u8 = [](float v){ v = v*255.f; return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); };
     for (int f = 0; f < FoAll; ++f) {
@@ -1632,7 +1687,16 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
                 if (ll > 1e-20f) {
                     for (int a = 0; a < 3; ++a) n_lo[a] /= ll;
                     float hi[3];
-                    if (ns->sample_raw(p, n_lo, face_bound[f], hi, true, ns->sign)) {
+                    float hitd = 0.f;
+                    if (ns->sample_raw(p, n_lo, face_bound[f], hi, true, ns->sign, &hitd)) {
+                        // How far the accepted hit was, in mm (TRELLIS space is a
+                        // 1 m cube). The offset shell is only 2*eps ~ 4 mm thick,
+                        // so anything far beyond that is a surface elsewhere on
+                        // the object rather than the one under this texel.
+                        {
+                            const int mm = (int)(hitd * 1000.f + 0.5f);
+                            ++disthist[mm < 0 ? 0 : (mm > 200 ? 200 : mm)];
+                        }
                         for (int a = 0; a < 3; ++a) hi[a] *= ns->sign;
                         const float dot = std::max(-1.f, std::min(1.f,
                             hi[0]*n_lo[0] + hi[1]*n_lo[1] + hi[2]*n_lo[2]));
@@ -1680,7 +1744,7 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
     xatlas::Destroy(atlas);
 
     telea_inpaint(out.base, out.mr, mask, T, 3, 1);
-    if (ns) {
+    if (ns && !out.nrm.empty()) {
         dilate_normals(out.nrm, nmask, T, nsrc->tangent_space);
         size_t cum = 0; const size_t tot = nrm_hits ? nrm_hits : 1;
         int p50 = 0, p90 = 0, p99 = 0;
@@ -1689,6 +1753,17 @@ BakedMesh uv_bake(const std::vector<float>& verts, int V, const std::vector<int3
             if (!p50 && cum*100 >= tot*50) p50 = d;
             if (!p90 && cum*100 >= tot*90) p90 = d;
             if (!p99 && cum*100 >= tot*99) p99 = d;
+        }
+        {
+            size_t dc = 0; int d50 = 0, d90 = 0, d99 = 0;
+            for (int d = 0; d <= 200; ++d) {
+                dc += disthist[d];
+                if (!d50 && dc*100 >= tot*50) d50 = d;
+                if (!d90 && dc*100 >= tot*90) d90 = d;
+                if (!d99 && dc*100 >= tot*99) d99 = d;
+            }
+            printf("  normal_bake: hit distance p50=%dmm p90=%dmm p99=%dmm (shell is ~%.1fmm thick)\n",
+                   d50, d90, d99, 2000.0f * 0.0019645f);
         }
         printf("  normal_bake: %zu texels (%zu unreachable, %.2f%%), deviation p50=%ddeg p90=%ddeg p99=%ddeg, %s space\n",
                nrm_hits, nrm_miss, 100.0 * nrm_miss / (double)(nrm_hits + nrm_miss ? nrm_hits + nrm_miss : 1),

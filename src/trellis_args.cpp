@@ -40,6 +40,12 @@ void print_usage(const char* argv0, bool server) {
         "      --normal-map        bake a tangent-space normal map from the high-poly\n"
         "                          (requires --strip-interior)\n"
         "      --normal-search K   normal-bake search bound, in local edge lengths (default 2)\n"
+        "      --normal-cap-shells K  cap the normal-bake search at K offset-shell\n"
+        "                          thicknesses (default 4, 0 = uncapped) -- stops the\n"
+        "                          search tunnelling out the far side of the object\n"
+        "      --normal-min-dot K  abandon the normal bake below this winding consensus\n"
+        "                          (default 0.85, 0 disables) -- catches an asset whose\n"
+        "                          buried sheets the strip failed to remove\n"
         "      --strip-interior    drop the buried sheets of the narrow-band shell before\n"
         "                          simplifying, so the budget is spent on the visible\n"
         "                          surface (no-op when nothing is buried)\n"
@@ -98,6 +104,8 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "--strip-interior")       { p.strip_interior = true; }
         else if (a == "--normal-map")           { p.normal_map = true; }
         else if (a == "--normal-search")        { const char* v = need(a.c_str()); if (!v) return false; p.normal_search = (float)atof(v); }
+        else if (a == "--normal-min-dot")       { const char* v = need(a.c_str()); if (!v) return false; p.normal_min_dot = (float)atof(v); }
+        else if (a == "--normal-cap-shells")    { const char* v = need(a.c_str()); if (!v) return false; p.normal_cap_shells = (float)atof(v); }
         else if (a == "--band")                 { const char* v = need(a.c_str()); if (!v) return false; p.band = atoi(v); }
         else if (a == "--decim")                { const char* v = need(a.c_str()); if (!v) return false; p.decim = atoi(v); }
         else if (a == "--atlas" || a == "--tex"){ const char* v = need(a.c_str()); if (!v) return false; p.tex = atoi(v); }
