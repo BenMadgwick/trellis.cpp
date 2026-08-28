@@ -1,5 +1,6 @@
 #include "strip_interior.h"
 #include "tri_bvh.h"
+#include <thread>
 #include <functional>
 #include <unordered_map>
 #include <algorithm>
@@ -375,16 +376,90 @@ int64_t strip_interior(std::vector<float>& verts, std::vector<int32_t>& faces,
         // Connectivity is untouched, so labels transfer back to the unshrunk
         // mesh by face index.
         if (opt.shrink) {
-            std::vector<float> pv((size_t)V*3);
-            for (int64_t v = 0; v < V; ++v) {
-                const float q[3] = { verts[3*(size_t)v], verts[3*(size_t)v+1], verts[3*(size_t)v+2] };
-                const TriBvh::Hit h = opt.ref_bvh->closest(q, 1e30f);
-                if (h.face >= 0) { for (int k = 0; k < 3; ++k) pv[3*(size_t)v+k] = h.point[k]; }
-                else             { for (int k = 0; k < 3; ++k) pv[3*(size_t)v+k] = q[k]; }
+            // Vertex adjacency, for the Laplacian term.
+            std::vector<int32_t> voff((size_t)V + 1, 0), vnb;
+            {
+                std::vector<int32_t> cnt((size_t)V, 0);
+                for (int64_t f = 0; f < F; ++f)
+                    for (int j = 0; j < 3; ++j) { ++cnt[(size_t)faces[3*f+j]]; ++cnt[(size_t)faces[3*f+(j+1)%3]]; }
+                for (int64_t v = 0; v < V; ++v) voff[(size_t)v+1] = voff[(size_t)v] + cnt[(size_t)v];
+                vnb.assign((size_t)voff[(size_t)V], -1);
+                std::vector<int32_t> fill((size_t)V, 0);
+                for (int64_t f = 0; f < F; ++f)
+                    for (int j = 0; j < 3; ++j) {
+                        const int32_t a = faces[3*f+j], b = faces[3*f+(j+1)%3];
+                        vnb[(size_t)voff[(size_t)a] + fill[(size_t)a]++] = b;
+                        vnb[(size_t)voff[(size_t)b] + fill[(size_t)b]++] = a;
+                    }
             }
 
-            // Face adjacency over the shrunk mesh, then flood the faces refusing
-            // to cross a crease. Each region is one sheet, bounded by the fold.
+            std::vector<float> pv = verts, tmp((size_t)V*3);
+            const unsigned nthr = std::max(1u, std::thread::hardware_concurrency());
+
+            // Alternate projection and Laplacian smoothing rather than
+            // projecting once. A single projection lands every vertex on the
+            // input but leaves the collapsed mesh badly distorted where the fold
+            // was, and the dihedrals there are then unreadable -- measured, it
+            // found 13,590 creases over 7.75M faces and separated nothing. The
+            // Laplacian is what keeps the collapsed sheets well-formed enough to
+            // carry a crease, which is why DCUDF has one.
+            for (int it = 0; it < opt.shrink_iters; ++it) {
+                std::vector<std::thread> th;
+                const int64_t chunk = (V + nthr - 1) / nthr;
+                for (unsigned t = 0; t < nthr; ++t) {
+                    const int64_t lo = (int64_t)t * chunk, hi2 = std::min(V, lo + chunk);
+                    if (lo >= hi2) break;
+                    th.emplace_back([&, lo, hi2]() {
+                        for (int64_t v = lo; v < hi2; ++v) {
+                            const float q[3] = { pv[3*(size_t)v], pv[3*(size_t)v+1], pv[3*(size_t)v+2] };
+                            const TriBvh::Hit h = opt.ref_bvh->closest(q, 1e30f);
+                            for (int k = 0; k < 3; ++k)
+                                tmp[3*(size_t)v+k] = h.face >= 0
+                                    ? q[k] + opt.shrink_alpha * (h.point[k] - q[k])
+                                    : q[k];
+                        }
+                    });
+                }
+                for (auto& t2 : th) t2.join();
+                // Laplacian, read from the projected positions
+                for (int64_t v = 0; v < V; ++v) {
+                    const int32_t a = voff[(size_t)v], b = voff[(size_t)v+1];
+                    if (b <= a) { for (int k = 0; k < 3; ++k) pv[3*(size_t)v+k] = tmp[3*(size_t)v+k]; continue; }
+                    float m[3] = {0,0,0};
+                    for (int32_t i = a; i < b; ++i)
+                        for (int k = 0; k < 3; ++k) m[k] += tmp[3*(size_t)vnb[(size_t)i]+k];
+                    const float inv = 1.f / (float)(b - a);
+                    for (int k = 0; k < 3; ++k) {
+                        const float sm = m[k] * inv;
+                        pv[3*(size_t)v+k] = tmp[3*(size_t)v+k] + opt.shrink_beta * (sm - tmp[3*(size_t)v+k]);
+                    }
+                }
+            }
+            if (opt.verbose) {
+                double moved = 0.0;
+                for (int64_t v = 0; v < V; ++v) {
+                    double d2 = 0.0;
+                    for (int k = 0; k < 3; ++k) { const double e = pv[3*(size_t)v+k] - verts[3*(size_t)v+k]; d2 += e*e; }
+                    moved += std::sqrt(d2);
+                }
+                printf("  strip_interior: shrink %d rounds, mean vertex travel %.3f mm (eps %.3f mm)\n",
+                       opt.shrink_iters, 1000.0 * moved / (double)V, 1000.0f * cell * 2.0f);
+            }
+
+            // Face adjacency over the shrunk mesh, with a weight per edge that
+            // says how freely a label may cross it.
+            //
+            // A flood that simply refuses to cross creases does not work: it
+            // needs the fold to be a COMPLETE barrier, and it is not -- 668
+            // crease edges over 7.75M faces, and the flood walks straight around
+            // them (85 regions, none of them a sheet). That is exactly why DCUDF
+            // reaches for a min-cut, which only needs the fold to be the
+            // CHEAPEST path rather than an impassable one.
+            //
+            // Anisotropic diffusion buys the same property without a maxflow
+            // solver: smoothing runs freely inside a sheet and is choked across
+            // a fold, so noise relaxes away while a label boundary that has
+            // found the fold stays put.
             std::vector<std::pair<uint64_t,int32_t>> ed;
             ed.reserve((size_t)F * 3);
             for (int64_t f = 0; f < F; ++f)
@@ -406,70 +481,127 @@ int64_t strip_interior(std::vector<float>& verts, std::vector<int32_t>& faces,
                 n[2] = e1[0]*e2[1]-e1[1]*e2[0];
                 const float l = std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
                 if (l > 1e-30f) { for (int k = 0; k < 3; ++k) n[k] /= l; return true; }
-                return false;   // degenerate after projection: treat as a crease
+                return false;
             };
 
-            // adjacency, keeping only edges that are NOT creases
             std::vector<int32_t> nbr_off((size_t)F + 1, 0), nbr;
+            std::vector<float>   nbw;
             {
-                const float cosT = std::cos(opt.fold_deg * 3.14159265f / 180.f);
-                std::vector<std::pair<int32_t,int32_t>> keepe;
-                keepe.reserve(ed.size() / 2);
+                std::vector<std::pair<int32_t,int32_t>> pe;
+                std::vector<float> pw;
+                pe.reserve(ed.size()/2); pw.reserve(ed.size()/2);
                 int64_t creases = 0;
                 for (size_t i = 0; i + 1 < ed.size(); ++i) {
                     if (ed[i].first != ed[i+1].first) continue;
                     const int32_t u = ed[i].second, v2 = ed[i+1].second;
                     float nu[3], nv[3];
                     const bool ou = fnorm(u, nu), ov = fnorm(v2, nv);
-                    const float d = ou && ov ? nu[0]*nv[0] + nu[1]*nv[1] + nu[2]*nv[2] : -1.f;
-                    if (d < cosT) { ++creases; continue; }   // folded: do not cross
-                    keepe.emplace_back(u, v2);
+                    float d = ou && ov ? nu[0]*nv[0] + nu[1]*nv[1] + nu[2]*nv[2] : -1.f;
+                    d = std::max(-1.f, std::min(1.f, d));
+                    // 1 where the surface is flat, ~0 where it folds back.
+                    // Squared so the choke is sharp without being a hard gate --
+                    // a hard gate is the flood again, and the flood failed.
+                    const float w = 0.5f * (1.f + d);
+                    if (d < 0.f) ++creases;
+                    pe.emplace_back(u, v2);
+                    pw.push_back(std::max(1e-3f, w * w));
                 }
-                if (opt.verbose)
-                    printf("  strip_interior: shrink -> %lld crease edges at >%.0f deg\n",
-                           (long long)creases, opt.fold_deg);
+                if (opt.verbose) {
+                    printf("  strip_interior: shrink -> %lld folded edges (>90 deg) of %zu\n",
+                           (long long)creases, pe.size());
+                    // Dihedral distribution on the shrunk mesh. If the fold
+                    // survives the shrink there is a population up near 180 deg;
+                    // if the Laplacian has rounded it away there is not, and no
+                    // threshold can recover what is no longer there.
+                    int64_t hb[19] = {0};
+                    for (size_t i = 0; i < pw.size(); ++i) {
+                        // pw = ((1+cos)/2)^2  ->  recover the angle
+                        const float c2 = std::sqrt(std::max(0.f, pw[i]));
+                        const float cs = std::max(-1.f, std::min(1.f, 2.f*c2 - 1.f));
+                        const int b = std::min(18, (int)(std::acos(cs) * 57.2957795f / 10.f));
+                        ++hb[b];
+                    }
+                    printf("  strip_interior: [diag] dihedral histogram (10 deg bins):\n");
+                    for (int b = 0; b < 19; ++b)
+                        if (hb[b]) printf("  strip_interior: [diag]   %3d-%3d deg %12lld (%.4f%%)\n",
+                                          b*10, b*10+10, (long long)hb[b],
+                                          100.0*(double)hb[b]/(double)pw.size());
+                }
                 std::vector<int32_t> cnt((size_t)F, 0);
-                for (auto& e : keepe) { ++cnt[(size_t)e.first]; ++cnt[(size_t)e.second]; }
+                for (auto& e : pe) { ++cnt[(size_t)e.first]; ++cnt[(size_t)e.second]; }
                 for (int64_t f = 0; f < F; ++f) nbr_off[(size_t)f+1] = nbr_off[(size_t)f] + cnt[(size_t)f];
                 nbr.assign((size_t)nbr_off[(size_t)F], -1);
+                nbw.assign((size_t)nbr_off[(size_t)F], 0.f);
                 std::vector<int32_t> fill((size_t)F, 0);
-                for (auto& e : keepe) {
-                    nbr[(size_t)nbr_off[(size_t)e.first] + fill[(size_t)e.first]++] = e.second;
-                    nbr[(size_t)nbr_off[(size_t)e.second] + fill[(size_t)e.second]++] = e.first;
+                for (size_t i = 0; i < pe.size(); ++i) {
+                    const int32_t u = pe[i].first, v2 = pe[i].second;
+                    nbr[(size_t)nbr_off[(size_t)u] + fill[(size_t)u]] = v2;
+                    nbw[(size_t)nbr_off[(size_t)u] + fill[(size_t)u]] = pw[i]; ++fill[(size_t)u];
+                    nbr[(size_t)nbr_off[(size_t)v2] + fill[(size_t)v2]] = u;
+                    nbw[(size_t)nbr_off[(size_t)v2] + fill[(size_t)v2]] = pw[i]; ++fill[(size_t)v2];
                 }
             }
 
-            std::vector<int32_t> reg((size_t)F, -1);
-            int32_t nreg = 0;
-            std::vector<int32_t> stk;
-            for (int64_t f0 = 0; f0 < F; ++f0) {
-                if (reg[(size_t)f0] >= 0) continue;
-                const int32_t id = nreg++;
-                reg[(size_t)f0] = id;
-                stk.clear(); stk.push_back((int32_t)f0);
-                while (!stk.empty()) {
-                    const int32_t f = stk.back(); stk.pop_back();
-                    for (int32_t i = nbr_off[(size_t)f]; i < nbr_off[(size_t)f+1]; ++i) {
-                        const int32_t g2 = nbr[(size_t)i];
-                        if (reg[(size_t)g2] < 0) { reg[(size_t)g2] = id; stk.push_back(g2); }
+            // Diagnostic: flood with folded edges removed and report what the
+            // resulting regions actually are. If the two walls join only through
+            // the rim, this should show two regions of ~50% each with opposite
+            // mean side-of-input distance. Anything else means the premise is
+            // wrong, and it is cheaper to look than to keep inferring.
+            if (opt.verbose) {
+                std::vector<int32_t> reg((size_t)F, -1);
+                int32_t nreg = 0;
+                std::vector<int32_t> stk;
+                for (int64_t f0 = 0; f0 < F; ++f0) {
+                    if (reg[(size_t)f0] >= 0) continue;
+                    const int32_t id = nreg++;
+                    reg[(size_t)f0] = id;
+                    stk.clear(); stk.push_back((int32_t)f0);
+                    while (!stk.empty()) {
+                        const int32_t f = stk.back(); stk.pop_back();
+                        for (int32_t i = nbr_off[(size_t)f]; i < nbr_off[(size_t)f+1]; ++i) {
+                            if (nbw[(size_t)i] < 0.25f) continue;   // treat a fold as a barrier here
+                            const int32_t g2 = nbr[(size_t)i];
+                            if (reg[(size_t)g2] < 0) { reg[(size_t)g2] = id; stk.push_back(g2); }
+                        }
                     }
                 }
+                std::vector<int64_t> cnt((size_t)nreg, 0);
+                std::vector<double>  msum((size_t)nreg, 0.0);
+                for (int64_t f = 0; f < F; ++f) { ++cnt[(size_t)reg[(size_t)f]]; msum[(size_t)reg[(size_t)f]] += sdist[(size_t)f]; }
+                std::vector<int32_t> ord((size_t)nreg);
+                for (int32_t i = 0; i < nreg; ++i) ord[(size_t)i] = i;
+                std::sort(ord.begin(), ord.end(), [&](int32_t a, int32_t b){ return cnt[(size_t)a] > cnt[(size_t)b]; });
+                printf("  strip_interior: [diag] %d fold-bounded regions; largest:\n", nreg);
+                for (int32_t i = 0; i < nreg && i < 6; ++i) {
+                    const int32_t r = ord[(size_t)i];
+                    printf("  strip_interior: [diag]   %10lld faces (%5.1f%%)  mean side %+.4f mm\n",
+                           (long long)cnt[(size_t)r], 100.0*(double)cnt[(size_t)r]/(double)F,
+                           1000.0 * msum[(size_t)r] / (double)cnt[(size_t)r]);
+                }
             }
 
-            // One vote per region: the seam is the region boundary, so the label
-            // can only change where the surface genuinely folds.
-            std::vector<double> vsum((size_t)nreg, 0.0);
-            std::vector<int64_t> vcnt((size_t)nreg, 0);
-            for (int64_t f = 0; f < F; ++f) { vsum[(size_t)reg[(size_t)f]] += sdist[(size_t)f]; ++vcnt[(size_t)reg[(size_t)f]]; }
+            std::vector<float> cur = sdist, nxt((size_t)F);
+            for (int it = 0; it < opt.smooth; ++it) {
+                for (int64_t f = 0; f < F; ++f) {
+                    float acc = cur[(size_t)f], wsum = 1.f;
+                    for (int32_t i = nbr_off[(size_t)f]; i < nbr_off[(size_t)f+1]; ++i) {
+                        const float w = nbw[(size_t)i];
+                        acc  += w * cur[(size_t)nbr[(size_t)i]];
+                        wsum += w;
+                    }
+                    nxt[(size_t)f] = acc / wsum;
+                }
+                cur.swap(nxt);
+            }
             int64_t flipped = 0;
             for (int64_t f = 0; f < F; ++f) {
-                const int8_t ns = vsum[(size_t)reg[(size_t)f]] > 0.0 ? 1 : -1;
+                const int8_t ns = cur[(size_t)f] > 0.f ? 1 : -1;
                 if (ns != sd[(size_t)f]) ++flipped;
                 sd[(size_t)f] = ns;
             }
             if (opt.verbose)
-                printf("  strip_interior: %d fold-bounded regions, relabelled %lld faces (%.2f%%)\n",
-                       nreg, (long long)flipped, 100.0 * (double)flipped / (double)F);
+                printf("  strip_interior: %d fold-aware passes relabelled %lld faces (%.2f%%)\n",
+                       opt.smooth, (long long)flipped, 100.0 * (double)flipped / (double)F);
         } else
 
         // The raw sign is globally right and locally noisy: near the fold, and

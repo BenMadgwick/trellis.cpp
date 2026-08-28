@@ -146,6 +146,8 @@ int main(int argc, char** argv) {
         else if (a == "--strip-smooth" && i+1 < argc) strip.smooth = atoi(argv[++i]);
         else if (a == "--strip-no-shrink") strip.shrink = false;
         else if (a == "--strip-fold" && i+1 < argc) strip.fold_deg = (float)atof(argv[++i]);
+        else if (a == "--strip-shrink-iters" && i+1 < argc) strip.shrink_iters = atoi(argv[++i]);
+        else if (a == "--strip-shrink-beta" && i+1 < argc) strip.shrink_beta = (float)atof(argv[++i]);
         else if (a == "--save-mesh" && i+1 < argc) save_mesh = argv[++i];
         else if (a == "--load-mesh" && i+1 < argc) load_mesh = argv[++i];
         else if (a == "--save-stripped" && i+1 < argc) save_stripped = argv[++i];

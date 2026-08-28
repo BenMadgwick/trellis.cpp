@@ -49,6 +49,10 @@ struct StripOpts {
     bool outward = false;
     bool shrink = true; // project onto the input surface before finding the seam
     float fold_deg = 120.f; // dihedral above which an edge is a fold, post-shrink
+    int   shrink_iters = 24;   // projection + smoothing rounds
+    float shrink_alpha = 0.8f; // pull toward the input surface per round
+    float shrink_beta  = 0.4f; // Laplacian per round; without it the collapsed
+                               //   mesh is too distorted to read dihedrals from
     int  smooth = 8;    // diffusion passes over face adjacency before thresholding
                         //   the side-of-input sign; 0 uses the raw sign
     // The PRE-remesh mesh and a BVH over it, for the outward test below.
