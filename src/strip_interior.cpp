@@ -356,10 +356,121 @@ int64_t strip_interior(std::vector<float>& verts, std::vector<int32_t>& faces,
             const double ar = 0.5 * std::sqrt(cx*cx + cy*cy + cz*cz);
             if (sgn > 0) area_pos += ar; else if (sgn < 0) area_neg += ar;
         }
-        const int keep_sign = area_pos >= area_neg ? 1 : -1;
-        if (opt.verbose)
-            printf("  strip_interior: side-of-input areas + %.1f cm2 / - %.1f cm2 -> keeping %s\n",
-                   area_pos * 1e4, area_neg * 1e4, keep_sign > 0 ? "+" : "-");
+        // ---- shrink, then cut along the fold --------------------------------
+        // Projecting every vertex onto the input surface collapses the fold.
+        //
+        // The two walls sit eps either side of the input, so where they join
+        // they turn through 180 degrees over an arc of radius eps -- a smooth
+        // cap with no crease anywhere, which is why a dihedral seed-and-grow
+        // found nothing to stop at and why diffusing labels cannot place a seam.
+        // Project both walls onto the input and that cap collapses to zero
+        // radius: the two sheets become coincident and oppositely wound, so the
+        // join is a genuine 180-degree crease on a single edge loop.
+        //
+        // This is DCUDF's shrink step (Hou et al., SIGGRAPH Asia 2023). Their
+        // gradient descent exists to tame noisy NEURAL fields; ours is exact, so
+        // the closest point IS the converged answer -- one Newton step, because
+        // v - UDF(v)*grad UDF(v) is just v - (v - p) = p.
+        //
+        // Connectivity is untouched, so labels transfer back to the unshrunk
+        // mesh by face index.
+        if (opt.shrink) {
+            std::vector<float> pv((size_t)V*3);
+            for (int64_t v = 0; v < V; ++v) {
+                const float q[3] = { verts[3*(size_t)v], verts[3*(size_t)v+1], verts[3*(size_t)v+2] };
+                const TriBvh::Hit h = opt.ref_bvh->closest(q, 1e30f);
+                if (h.face >= 0) { for (int k = 0; k < 3; ++k) pv[3*(size_t)v+k] = h.point[k]; }
+                else             { for (int k = 0; k < 3; ++k) pv[3*(size_t)v+k] = q[k]; }
+            }
+
+            // Face adjacency over the shrunk mesh, then flood the faces refusing
+            // to cross a crease. Each region is one sheet, bounded by the fold.
+            std::vector<std::pair<uint64_t,int32_t>> ed;
+            ed.reserve((size_t)F * 3);
+            for (int64_t f = 0; f < F; ++f)
+                for (int j = 0; j < 3; ++j) {
+                    int32_t a = faces[3*f+j], b = faces[3*f+(j+1)%3];
+                    if (a > b) std::swap(a, b);
+                    ed.emplace_back(((uint64_t)(uint32_t)a << 32) | (uint32_t)b, (int32_t)f);
+                }
+            std::sort(ed.begin(), ed.end());
+
+            auto fnorm = [&](int64_t f, float n[3]) {
+                const float* A = &pv[3*(size_t)faces[3*f+0]];
+                const float* B = &pv[3*(size_t)faces[3*f+1]];
+                const float* C = &pv[3*(size_t)faces[3*f+2]];
+                const float e1[3] = {B[0]-A[0], B[1]-A[1], B[2]-A[2]};
+                const float e2[3] = {C[0]-A[0], C[1]-A[1], C[2]-A[2]};
+                n[0] = e1[1]*e2[2]-e1[2]*e2[1];
+                n[1] = e1[2]*e2[0]-e1[0]*e2[2];
+                n[2] = e1[0]*e2[1]-e1[1]*e2[0];
+                const float l = std::sqrt(n[0]*n[0]+n[1]*n[1]+n[2]*n[2]);
+                if (l > 1e-30f) { for (int k = 0; k < 3; ++k) n[k] /= l; return true; }
+                return false;   // degenerate after projection: treat as a crease
+            };
+
+            // adjacency, keeping only edges that are NOT creases
+            std::vector<int32_t> nbr_off((size_t)F + 1, 0), nbr;
+            {
+                const float cosT = std::cos(opt.fold_deg * 3.14159265f / 180.f);
+                std::vector<std::pair<int32_t,int32_t>> keepe;
+                keepe.reserve(ed.size() / 2);
+                int64_t creases = 0;
+                for (size_t i = 0; i + 1 < ed.size(); ++i) {
+                    if (ed[i].first != ed[i+1].first) continue;
+                    const int32_t u = ed[i].second, v2 = ed[i+1].second;
+                    float nu[3], nv[3];
+                    const bool ou = fnorm(u, nu), ov = fnorm(v2, nv);
+                    const float d = ou && ov ? nu[0]*nv[0] + nu[1]*nv[1] + nu[2]*nv[2] : -1.f;
+                    if (d < cosT) { ++creases; continue; }   // folded: do not cross
+                    keepe.emplace_back(u, v2);
+                }
+                if (opt.verbose)
+                    printf("  strip_interior: shrink -> %lld crease edges at >%.0f deg\n",
+                           (long long)creases, opt.fold_deg);
+                std::vector<int32_t> cnt((size_t)F, 0);
+                for (auto& e : keepe) { ++cnt[(size_t)e.first]; ++cnt[(size_t)e.second]; }
+                for (int64_t f = 0; f < F; ++f) nbr_off[(size_t)f+1] = nbr_off[(size_t)f] + cnt[(size_t)f];
+                nbr.assign((size_t)nbr_off[(size_t)F], -1);
+                std::vector<int32_t> fill((size_t)F, 0);
+                for (auto& e : keepe) {
+                    nbr[(size_t)nbr_off[(size_t)e.first] + fill[(size_t)e.first]++] = e.second;
+                    nbr[(size_t)nbr_off[(size_t)e.second] + fill[(size_t)e.second]++] = e.first;
+                }
+            }
+
+            std::vector<int32_t> reg((size_t)F, -1);
+            int32_t nreg = 0;
+            std::vector<int32_t> stk;
+            for (int64_t f0 = 0; f0 < F; ++f0) {
+                if (reg[(size_t)f0] >= 0) continue;
+                const int32_t id = nreg++;
+                reg[(size_t)f0] = id;
+                stk.clear(); stk.push_back((int32_t)f0);
+                while (!stk.empty()) {
+                    const int32_t f = stk.back(); stk.pop_back();
+                    for (int32_t i = nbr_off[(size_t)f]; i < nbr_off[(size_t)f+1]; ++i) {
+                        const int32_t g2 = nbr[(size_t)i];
+                        if (reg[(size_t)g2] < 0) { reg[(size_t)g2] = id; stk.push_back(g2); }
+                    }
+                }
+            }
+
+            // One vote per region: the seam is the region boundary, so the label
+            // can only change where the surface genuinely folds.
+            std::vector<double> vsum((size_t)nreg, 0.0);
+            std::vector<int64_t> vcnt((size_t)nreg, 0);
+            for (int64_t f = 0; f < F; ++f) { vsum[(size_t)reg[(size_t)f]] += sdist[(size_t)f]; ++vcnt[(size_t)reg[(size_t)f]]; }
+            int64_t flipped = 0;
+            for (int64_t f = 0; f < F; ++f) {
+                const int8_t ns = vsum[(size_t)reg[(size_t)f]] > 0.0 ? 1 : -1;
+                if (ns != sd[(size_t)f]) ++flipped;
+                sd[(size_t)f] = ns;
+            }
+            if (opt.verbose)
+                printf("  strip_interior: %d fold-bounded regions, relabelled %lld faces (%.2f%%)\n",
+                       nreg, (long long)flipped, 100.0 * (double)flipped / (double)F);
+        } else
 
         // The raw sign is globally right and locally noisy: near the fold, and
         // wherever the closest-point query lands on a differently-oriented input
@@ -422,6 +533,47 @@ int64_t strip_interior(std::vector<float>& verts, std::vector<int32_t>& faces,
                 printf("  strip_interior: %d smoothing passes relabelled %lld faces (%.2f%%)\n",
                        opt.smooth, (long long)flipped, 100.0 * (double)flipped / (double)F);
         }
+
+        // Which side is the outer one? NOT by area: for a bag wrapping a sheet
+        // both walls are ~the sheet's area, and on the dog they came out 13447
+        // against 13333 cm2 -- a 0.9% margin, which is a coin flip, and getting
+        // it wrong discards the entire visible surface.
+        //
+        // Decide it by what a camera would see instead. Fire rays inward from a
+        // bounding sphere and read the label of each FIRST hit: a first hit is
+        // on the outer wall by definition. Individually noisy, decisive in
+        // aggregate, and it only has to get one global bit right.
+        int keep_sign;
+        {
+            float c0[3] = {0,0,0}, rad = 0.f;
+            for (int k = 0; k < 3; ++k) c0[k] = 0.5f * (bmin[k] + bmax[k]);
+            for (int k = 0; k < 3; ++k) rad = std::max(rad, bmax[k] - bmin[k]);
+            rad *= 1.2f;
+            trellis::TriBvh self = trellis::TriBvh::build(verts.data(), V, faces.data(), F);
+            int64_t vpos = 0, vneg = 0, miss = 0;
+            const int NR = 4096;
+            for (int i = 0; i < NR; ++i) {
+                // Fibonacci sphere: even coverage without clumping at the poles.
+                const float t = (i + 0.5f) / (float)NR;
+                const float z = 1.f - 2.f * t;
+                const float r = std::sqrt(std::max(0.f, 1.f - z*z));
+                const float ph = 2.39996323f * i;
+                const float d[3] = { r*std::cos(ph), r*std::sin(ph), z };
+                const float o2[3] = { c0[0] + d[0]*rad, c0[1] + d[1]*rad, c0[2] + d[2]*rad };
+                const float dir[3] = { -d[0], -d[1], -d[2] };
+                const TriBvh::RayHit h = self.ray(o2, dir, 4.f * rad);
+                if (h.face < 0) { ++miss; continue; }
+                const int8_t l = sd[(size_t)h.face];
+                if (l > 0) ++vpos; else if (l < 0) ++vneg;
+            }
+            keep_sign = vpos >= vneg ? 1 : -1;
+            if (opt.verbose)
+                printf("  strip_interior: first-hit vote + %lld / - %lld (%lld missed) -> keeping %s"
+                       "  [areas + %.0f / - %.0f cm2]\n",
+                       (long long)vpos, (long long)vneg, (long long)miss,
+                       keep_sign > 0 ? "+" : "-", area_pos * 1e4, area_neg * 1e4);
+        }
+
 
         for (int64_t f = 0; f < F; ++f)
             if (sd[(size_t)f] == keep_sign) { vis[(size_t)f] = 1; ++seen; }
