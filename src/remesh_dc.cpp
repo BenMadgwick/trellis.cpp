@@ -391,6 +391,21 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
         fprintf(stderr, "  remesh: only %lld active voxels; skipping remesh\n", (long long)Na);
         return out;
     }
+    // Announce the scale BEFORE the field pass, which is the expensive part and
+    // was previously silent from here until it finished. In Interior mode it
+    // casts 8-64 rays per band vertex through a BVH over the whole input, and
+    // that input can be enormous on a porous subject: measured, a 34.6 M-face
+    // pallet of paving stones at res 768 ran over an hour without a word, while
+    // a 14.7 M-face bear at res 1024 took 472 s. A stage that can take that long
+    // must at least say what it is chewing on.
+    printf("  remesh_dc: %lld active voxels over %lld input faces (%s, res %d, band %d)%s\n",
+           (long long)Na, (long long)iF,
+           mode == RemeshMode::Interior ? "INTERIOR" : (mode == RemeshMode::Signed5 ? "SIGNED5" : "UNSIGNED"),
+           res, band,
+           mode == RemeshMode::Interior && iF > 20000000
+               ? "  <- large porous input; the parity pass will be slow, consider --remesh-mode unsigned"
+               : "");
+    fflush(stdout);
 
     std::unordered_map<uint64_t, int> vox;
     vox.reserve((size_t)Na * 2);
