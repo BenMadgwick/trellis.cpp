@@ -539,17 +539,36 @@ int drop_duplicate_faces(std::vector<int32_t>& faces) {
             return (size_t)(z ^ (z >> 31));
         }
     };
-    std::unordered_set<Key, KeyHash> seen;
-    seen.reserve(F * 2);
+    // Sort the keys rather than hashing them: at 14.7 M faces a hash set of
+    // distinct keys is dominated by cache misses, and the key build
+    // parallelises. Each entry carries its face index so the FIRST occurrence
+    // still wins, exactly as the hash version's insert-and-test did.
+    struct Ent {
+        Key k; int32_t f;
+        bool operator<(const Ent& o) const {
+            if (k.lo != o.k.lo) return k.lo < o.k.lo;
+            if (k.hi != o.k.hi) return k.hi < o.k.hi;
+            return f < o.f;
+        }
+    };
+    std::vector<Ent> ent(F);
+    parallel_for((int64_t)F, [&](int64_t b0, int64_t e0) {
+        for (int64_t f = b0; f < e0; ++f) {
+            int32_t a = faces[3*f], b = faces[3*f+1], c = faces[3*f+2];
+            if (a > b) std::swap(a, b);
+            if (b > c) std::swap(b, c);
+            if (a > b) std::swap(a, b);
+            ent[(size_t)f] = Ent{ Key{ ((uint64_t)(uint32_t)a << 32) | (uint32_t)b, c }, (int32_t)f };
+        }
+    });
+    std::sort(ent.begin(), ent.end());
+    std::vector<uint8_t> drop(F, 0);
+    for (size_t i = 1; i < ent.size(); ++i)
+        if (ent[i].k == ent[i-1].k) drop[(size_t)ent[i].f] = 1;   // a later duplicate
     std::vector<int32_t> kept;
     kept.reserve(faces.size());
     for (size_t f = 0; f < F; ++f) {
-        int32_t a = faces[3*f], b = faces[3*f+1], c = faces[3*f+2];
-        if (a > b) std::swap(a, b);
-        if (b > c) std::swap(b, c);
-        if (a > b) std::swap(a, b);
-        const Key k{ ((uint64_t)(uint32_t)a << 32) | (uint32_t)b, c };
-        if (!seen.insert(k).second) continue;
+        if (drop[f]) continue;
         kept.push_back(faces[3*f]); kept.push_back(faces[3*f+1]); kept.push_back(faces[3*f+2]);
     }
     const int removed = (int)(F - kept.size() / 3);
@@ -780,25 +799,39 @@ int drop_small_components(std::vector<float>& verts, std::vector<int32_t>& faces
 int fill_holes(std::vector<float>& verts, std::vector<int32_t>& faces, float max_perimeter) {
     const size_t F = faces.size() / 3;
     if (F == 0) return 0;
-    // count undirected edge uses; remember one directed representative
-    std::unordered_map<uint64_t, std::pair<int,uint64_t>> euse;   // key -> {count, directed (u<<32|v)}
-    euse.reserve(F * 3);
-    auto ekey = [](int a, int b) -> uint64_t { if (a > b) { int t = a; a = b; b = t; } return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b; };
-    for (size_t f = 0; f < F; ++f) {
-        const int32_t* t = &faces[3*f];
-        for (int k = 0; k < 3; ++k) {
-            const int u = t[k], v = t[(k+1)%3];
-            auto& e = euse[ekey(u, v)];
-            ++e.first; e.second = ((uint64_t)(uint32_t)u << 32) | (uint32_t)v;
+    // Count undirected edge uses by sorting, not hashing -- see
+    // fill_small_holes for why (a hash map over millions of distinct edge keys
+    // is dominated by cache misses). Undirected pair in the high bits so the
+    // two uses of an edge sort together; direction bit in bit 0 recovers which
+    // way a single use ran.
+    std::vector<uint64_t> ek((size_t)F * 3);
+    parallel_for((int64_t)F, [&](int64_t b0, int64_t e0) {
+        for (int64_t f = b0; f < e0; ++f) {
+            const int32_t* t = &faces[3*f];
+            for (int k = 0; k < 3; ++k) {
+                const int32_t u = t[k], v = t[(k+1)%3];
+                const uint64_t mn = (uint64_t)(uint32_t)std::min(u, v);
+                const uint64_t mx = (uint64_t)(uint32_t)std::max(u, v);
+                ek[(size_t)f*3 + k] = (((mn << 31) | mx) << 1) | (uint64_t)(u > v);
+            }
         }
-    }
+    });
+    std::sort(ek.begin(), ek.end());
     // rim successor map: boundary edge (u,v) is traversed v->u, so nxt[v] = u
     std::unordered_map<int,int> nxt;
-    for (auto& kv : euse)
-        if (kv.second.first == 1) {
-            const int u = (int)(kv.second.second >> 32), v = (int)(kv.second.second & 0xFFFFFFFF);
+    for (size_t i = 0; i < ek.size(); ) {
+        const uint64_t canon = ek[i] >> 1;
+        size_t j = i + 1;
+        while (j < ek.size() && (ek[j] >> 1) == canon) ++j;
+        if (j - i == 1) {
+            const int mn = (int)(uint32_t)(canon >> 31);
+            const int mx = (int)(uint32_t)(canon & 0x7FFFFFFFull);
+            const int u = (ek[i] & 1) ? mx : mn;
+            const int v = (ek[i] & 1) ? mn : mx;
             if (!nxt.emplace(v, u).second) nxt[v] = INT32_MIN;   // non-manifold junction: poison
         }
+        i = j;
+    }
     int filled = 0;
     std::unordered_map<int,char> visited;
     std::vector<int> loop;
