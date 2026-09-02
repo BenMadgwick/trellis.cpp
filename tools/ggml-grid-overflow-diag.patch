@@ -1,0 +1,71 @@
+# Grid-overflow diagnostic for the vendored ggml submodule.
+#
+# gridDim.y and gridDim.z are capped at 65535 by every CUDA architecture (only x
+# reaches 2^31-1). A kernel that binds a token count to y or z therefore dies with
+# a bare cudaErrorInvalidArgument at ggml_cuda_kernel_launch -- a wrapper shared by
+# most kernels, so the abort names no kernel, no op and no dimension. That is what
+# made TRELLIS_ISSUES.md ISSUE-001 hard to place.
+#
+# This prints the op, the destination shape and the grid/block dims before the
+# launch is rejected. It found ISSUE-001 in one run: RMS_NORM, dst ne
+# [128, 12, 65536], grid (12, 65536, 1).
+#
+# Kept as a patch rather than a submodule commit: pointing the submodule at a
+# commit that does not exist upstream would break every other checkout.
+#
+# Apply:    cd thirdparty/ggml && git apply ../../tools/ggml-grid-overflow-diag.patch
+# Revert:   cd thirdparty/ggml && git checkout -- src/ggml-cuda/
+#
+diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
+index 41e1b81..3d010ee 100644
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -1620,8 +1620,30 @@ static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
+ # define GGML_CUDA_RESTRICT __restrict__
+ # endif // defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+ 
++// DIAGNOSTIC (trellis.cpp fork): which graph node is currently dispatching, so a
++// failed launch can name itself. gridDim.y and gridDim.z are capped at 65535 by
++// every CUDA architecture (only x reaches 2^31-1), and a kernel that binds a
++// token count to y or z therefore dies with a bare cudaErrorInvalidArgument at
++// the launch site below -- naming no kernel, no op and no dimension. See
++// TRELLIS_ISSUES.md ISSUE-001.
++extern const char * g_ggml_cuda_dbg_op;
++extern int64_t      g_ggml_cuda_dbg_ne[4];
++
+ template<typename Kernel, typename... Args>
+ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_kernel_launch_params & launch_params, Args&&... args) {
++    if (launch_params.block_nums.y > 65535 || launch_params.block_nums.z > 65535) {
++        fprintf(stderr,
++                "\nggml-cuda: GRID OVERFLOW in op '%s' (dst ne = %lld %lld %lld %lld)\n"
++                "           grid = (%u, %u, %u), block = (%u, %u, %u)\n"
++                "           gridDim.%s exceeds the hard 65535 cap; this launch will be rejected.\n",
++                g_ggml_cuda_dbg_op ? g_ggml_cuda_dbg_op : "?",
++                (long long) g_ggml_cuda_dbg_ne[0], (long long) g_ggml_cuda_dbg_ne[1],
++                (long long) g_ggml_cuda_dbg_ne[2], (long long) g_ggml_cuda_dbg_ne[3],
++                launch_params.block_nums.x, launch_params.block_nums.y, launch_params.block_nums.z,
++                launch_params.block_dims.x, launch_params.block_dims.y, launch_params.block_dims.z,
++                launch_params.block_nums.y > 65535 ? "y" : "z");
++        fflush(stderr);
++    }
+ #if defined(GGML_CUDA_USE_PDL)
+ 
+     static const bool env_pdl_enabled = []() {
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 61041bd..88991eb 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -2826,7 +2826,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         nb1, nb2, nb3, stream);
+ }
+ 
++// DIAGNOSTIC (trellis.cpp fork): see the grid-overflow check in common.cuh.
++const char * g_ggml_cuda_dbg_op = nullptr;
++int64_t      g_ggml_cuda_dbg_ne[4] = {0, 0, 0, 0};
++
+ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
++    g_ggml_cuda_dbg_op = ggml_op_name(dst->op);
++    for (int i = 0; i < 4; ++i) g_ggml_cuda_dbg_ne[i] = dst->ne[i];
+     switch (dst->op) {
+         case GGML_OP_ARGMAX:
+             ggml_cuda_argmax(ctx, dst);

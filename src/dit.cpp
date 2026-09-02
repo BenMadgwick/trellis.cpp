@@ -35,8 +35,27 @@ static T* layernorm(ggml_context* c, T* x, float eps, T* w = nullptr, T* b = nul
 }
 
 // MultiHeadRMSNorm: ggml_rms_norm(x) already == F.normalize(x)*sqrt(head_dim); then * gamma.
+//
+// x is [head_dim, n_heads, L]. ggml-cuda's rms_norm launches one block per
+// (row, channel, sample) = (n_heads, L, 1), so the TOKEN COUNT lands in
+// gridDim.y -- which every CUDA architecture caps at 65535, while gridDim.x
+// reaches 2^31-1. At L >= 65536 the launch is rejected with a bare
+// cudaErrorInvalidArgument and the process dies inside the flow, before step 1.
+// That is ISSUE-001: measured exactly here, 65535 tokens OK / 65536 fatal, on
+// op RMS_NORM with dst ne = [128, 12, 65536].
+//
+// The norm reduces over ne0 and treats every higher dimension independently, so
+// folding n_heads and L into one axis is the SAME arithmetic on the same rows --
+// it just moves the big count into gridDim.x. No kernel patch, and nothing
+// vendored to re-apply on the next ggml bump.
 static T* rms_gamma(ggml_context* c, T* x, T* gamma, float eps) {
-    x = ggml_rms_norm(c, x, eps);
+    if (x->ne[2] > 65535 && x->ne[3] == 1 && ggml_is_contiguous(x)) {
+        const int64_t ne0 = x->ne[0], ne1 = x->ne[1], ne2 = x->ne[2];
+        T* flat = ggml_rms_norm(c, ggml_reshape_2d(c, x, ne0, ne1 * ne2), eps);
+        x = ggml_reshape_3d(c, flat, ne0, ne1, ne2);
+    } else {
+        x = ggml_rms_norm(c, x, eps);
+    }
     return ggml_mul(c, x, gamma);   // gamma cast to f32 by caller
 }
 

@@ -337,6 +337,10 @@ add_executable(trellis-test-sparse-degenerate src/test_sparse_degenerate.cpp)
 target_link_libraries(trellis-test-sparse-degenerate PRIVATE trellis_core)
 set_target_properties(trellis-test-sparse-degenerate PROPERTIES BUILD_RPATH "${GGML_RPATH}")
 
+add_executable(trellis-test-token-limit src/test_token_limit.cpp)
+target_link_libraries(trellis-test-token-limit PRIVATE trellis_core)
+set_target_properties(trellis-test-token-limit PROPERTIES BUILD_RPATH "${GGML_RPATH}")
+
 add_executable(trellis-test-mesh-stage src/test_mesh_stage.cpp)
 target_link_libraries(trellis-test-mesh-stage PRIVATE trellis_core)
 set_target_properties(trellis-test-mesh-stage PROPERTIES BUILD_RPATH "${GGML_RPATH}")
