@@ -77,6 +77,17 @@ void print_usage(const char* argv0, bool server) {
         "                          a dense res-1024 decode to a clean res-512 PBR volume)\n"
         "      --webp on|off       encode GLB textures as WebP (default: on when built with\n"
         "                          WebP support; off = PNG)\n"
+        "    two-stage generation (structure preview, then resume):\n"
+        "      --vox-only          stop after the sparse-structure decode (~1-2 s) instead\n"
+        "                          of running shape + texture + bake (~45-60 s)\n"
+        "      --vox-render PNG    write a 4-view voxel preview (front / three-quarter /\n"
+        "                          side / top) so a bad structure can be spotted and the\n"
+        "                          job abandoned before it costs the GPU time\n"
+        "      --save-vox FILE     write the resume cache (voxels + DINOv3 conditioning)\n"
+        "      --load-vox FILE     resume from that cache, skipping preprocess, DINOv3 and\n"
+        "                          the structure flow. Needs NO input image: the cache holds\n"
+        "                          the conditioning, which is all the later stages ever used\n"
+        "                          the image for\n"
         "      --dump-bg           also write the background-removal cutout as <out>_cutout.png\n"
         "      --bg-only           background removal only: write the cutout and skip the rest\n"
         "      --f32               f32 sparse-conv compute\n"
@@ -142,6 +153,10 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "--webp")                 { const char* v = need(a.c_str()); if (!v) return false;
                                                   p.webp = (std::strcmp(v,"off")==0 || std::strcmp(v,"0")==0 || std::strcmp(v,"false")==0) ? 0
                                                          : (std::strcmp(v,"on")==0 || std::strcmp(v,"1")==0 || std::strcmp(v,"true")==0) ? 1 : -1; }
+        else if (a == "--vox-only")             { p.vox_only = true; }
+        else if (a == "--vox-render")           { const char* v = need(a.c_str()); if (!v) return false; p.vox_render = v; }
+        else if (a == "--save-vox")             { const char* v = need(a.c_str()); if (!v) return false; p.save_vox = v; }
+        else if (a == "--load-vox")             { const char* v = need(a.c_str()); if (!v) return false; p.load_vox = v; }
         else if (a == "--dump-bg")              { p.dump_bg = true; }
         else if (a == "--bg-only")              { p.bg_only = true; p.dump_bg = true; }
         else if (a == "--f32")                  { p.f32 = true; }
@@ -158,6 +173,14 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (positional == 0)               { p.image  = a; positional = 1; }
         else if (positional == 1)               { p.output = a; positional = 2; }
         else                                    { fprintf(stderr, "[trellis] unexpected argument: %s\n", a.c_str()); return false; }
+    }
+    // A resumed run takes no image, so its ONE bare positional is the output.
+    // Without this, `trellis-cli --load-vox c.vox out.glb` -- the obvious way to
+    // write it -- puts out.glb in `image`, and the model is silently written to
+    // the default model.glb instead.
+    if (!p.load_vox.empty() && positional == 1) {
+        p.output = p.image;
+        p.image.clear();
     }
     return true;
 }

@@ -13,6 +13,8 @@
 #include "tri_bvh.h"
 #include "remesh_dc.h"
 #include "mesh_audit.h"
+#include "vox_preview.h"
+#include "vox_cache.h"
 #include "strip_interior.h"
 #include "shading.h"
 #include "stb_image_write.h"
@@ -88,10 +90,45 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     const std::string& outglb = cfg.output;
     const std::string& M = cfg.models;
     const int gpu = cfg.gpu;
-    const bool cascade = cfg.cascade;   // 1024 cascade is the TRELLIS default; --res 512 forces the light path
+    // 1024 cascade is the TRELLIS default; --res 512 forces the light path.
+    // Not const: --load-vox adopts whichever the cached run used, since the
+    // cached conditioning only exists for that path.
+    bool cascade = cfg.cascade;
     std::mt19937 rng(run_seed); std::normal_distribution<float> randn(0.f, 1.f);
     auto noise = [&](size_t n){ vector<float> v(n); for (auto& x : v) x = randn(rng); return v; };
     double t0 = now();
+
+    // ---- stages [1]-[3], or the cache that replaces them ----------------------
+    vector<float> cond, cond1024, neg, neg1024;
+    vector<std::array<int,3>> coords;
+    int vox_grid = 32, Lc = 0, Lc1024 = 0;
+    // The negative conditioning is a zero vector of the same length, so it is
+    // derived rather than stored or recomputed.
+    auto size_cond = [&] {
+        Lc      = (int)(cond.size() / 1024);
+        Lc1024  = cascade ? (int)(cond1024.size() / 1024) : 0;
+        neg.assign(cond.size(), 0.0f);
+        neg1024.assign(cond1024.size(), 0.0f);
+    };
+    if (!cfg.load_vox.empty()) {
+        trellis::VoxCache vc;
+        if (!trellis::load_vox_cache(cfg.load_vox, vc)) return 1;
+        printf("[1-3/6] skipped (resumed from %s)\n", cfg.load_vox.c_str());
+        // Honour the resumed run's --res where the cache can support it: the HR
+        // grid is re-derived from the upsampled coords, so previewing once and
+        // then choosing a resolution is legitimate. The one thing that cannot be
+        // conjured is the 1024 conditioning, which only a cascade run recorded.
+        if (cascade && vc.cond1024.empty()) {
+            fprintf(stderr, "[trellis] %s was cached from a non-cascade (--res 512) run and has no\n"
+                            "          1024 conditioning; continuing on the 512 path\n", cfg.load_vox.c_str());
+            cascade = false;
+        }
+        vox_grid = vc.grid;
+        coords   = std::move(vc.coords);
+        cond     = std::move(vc.cond);
+        cond1024 = std::move(vc.cond1024);
+        size_cond();   // cascade is now the cached one, so this must follow it
+    } else {
 
     bool birefnet = cfg.birefnet == 1;
     if (cfg.birefnet < 0) {
@@ -142,21 +179,16 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     }
 
     printf("[2/6] DINOv3 conditioning\n");
-    vector<float> cond, cond1024;
     { trellis::Model m = trellis::Model::load(M + "/dinov3.gguf", gpu);
       cond = trellis::dinov3_encode(m, chw, 512);
       if (cascade) cond1024 = trellis::dinov3_encode(m, chw1024, 1024);
       m.free(); }
-    const int Lc = (int)(cond.size() / 1024);
-    vector<float> neg(cond.size(), 0.0f);
-    const int Lc1024 = cascade ? (int)(cond1024.size() / 1024) : 0;
-    vector<float> neg1024(cond1024.size(), 0.0f);
+    size_cond();
     printf("      cond tokens=%d%s\n", Lc, cascade ? (" / 1024-cond tokens=" + std::to_string(Lc1024)).c_str() : "");
     slat_stats("cond_512 (DINOv3@512)", cond);
     if (cascade) slat_stats("cond_1024 (DINOv3@1024)", cond1024);
 
     printf("[3/6] sparse-structure flow + decode\n");
-    vector<std::array<int,3>> coords;
     {
         trellis::Model m = trellis::Model::load(M + "/ss_flow.gguf", gpu);
         trellis::DiTParams p; p.in_ch = 8; p.out_ch = 8; p.d_cond = 1024; p.cast_f32 = F32;
@@ -172,9 +204,32 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         vector<float> logits = trellis::ss_decode(d, zdec); d.free();
         coords = trellis::ss_coords(logits, 64, 32);
     }
+
+    }   // end of stages [1]-[3]; --load-vox skips all of the above
+
     if (cfg.voxply) { FILE*f=fopen("out/myvox.ply","wb"); fprintf(f,"ply\nformat binary_little_endian 1.0\nelement vertex %zu\nproperty float x\nproperty float y\nproperty float z\nelement face 0\nproperty list uchar int vertex_indices\nend_header\n",coords.size()); for(auto&c:coords){float p[3]={(c[0]+0.5f)/32-0.5f,(c[1]+0.5f)/32-0.5f,(c[2]+0.5f)/32-0.5f}; fwrite(p,4,3,f);} fclose(f); }
-    printf("      active voxels @res32 = %d\n", (int)coords.size());
+    printf("      active voxels @res%d = %d\n", vox_grid, (int)coords.size());
     if (coords.empty()) { fprintf(stderr, "no voxels produced\n"); return 1; }
+
+    // ---- the offramp ---------------------------------------------------------
+    // Everything above costs ~1-2 s; everything below costs ~45-60 s. This is the
+    // one point where a bad generation is both already visible and not yet
+    // expensive, so it is where a preview belongs.
+    if (!cfg.vox_render.empty())
+        trellis::write_vox_preview(coords, vox_grid, cfg.vox_render);
+    if (!cfg.save_vox.empty()) {
+        trellis::VoxCache vc;
+        vc.cascade = cascade; vc.hr_res = cfg.hr_res; vc.grid = vox_grid; vc.seed = run_seed;
+        vc.coords = coords; vc.cond = cond; vc.cond1024 = cond1024;
+        if (!trellis::save_vox_cache(cfg.save_vox, vc)) return 1;
+    }
+    if (cfg.vox_only) {
+        if (cfg.vox_render.empty() && cfg.save_vox.empty() && !cfg.voxply)
+            printf("      (--vox-only with no --vox-render / --save-vox / --voxply "
+                   "produced nothing; the run is discarded)\n");
+        printf("[vox-only] done (%.1fs) -- resume with --load-vox\n", now() - t0);
+        return 0;
+    }
 
     const bool do_tex = cfg.texture;
 
@@ -233,10 +288,37 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             const float g = (float)gi;
             std::set<std::array<int,3>> q;
             for (auto& c : hr_coords) q.insert({ (int)((c[0]+0.5f)/512.f*g), (int)((c[1]+0.5f)/512.f*g), (int)((c[2]+0.5f)/512.f*g) });
-            if ((int)q.size() < max_tok || hr_res <= 1024) {
+            // The reference floors this backoff at 1024, and on a --res 1024 run
+            // that floor is the FIRST iteration -- so max_tok was never consulted
+            // and any token count whatsoever was accepted. That is why
+            // "--max-tokens 98304" changed nothing for the job that produced
+            // 83,110 tokens; lowering it would not have either.
+            //
+            // Letting the count run free is not survivable on a 16 GB card even
+            // now that the >65535 launch limit is fixed (dit.cpp rms_gamma).
+            // Measured on this pallet at 80,554 tokens: 15,855 of 16,384 MiB
+            // VRAM, GPU pinned at 100%, and ONE of twelve flow steps took
+            // 5,226 s -- a ~16 hour projection, against ~90 s/step at 59 k. It
+            // pages through managed memory rather than failing, which on a shared
+            // GPU is worse than the old crash: it takes the queue with it.
+            //
+            // So the budget is enforced by carrying the backoff below 1024 --
+            // dropping the grid keeps a coherent structure, where thinning the
+            // token set would punch holes through it. --max-tokens 0 disables
+            // enforcement for anyone who wants the full-detail path and has the
+            // VRAM for it.
+            const int floor_res = max_tok > 0 ? 512 : 1024;
+            if ((int)q.size() < max_tok || max_tok <= 0 || hr_res <= floor_res) {
                 shc.assign(q.begin(), q.end());
                 printf("      upsampled coords @res512=%d -> quantized @res%d (grid %d) = %d tokens\n",
                        (int)hr_coords.size(), hr_res, gi, (int)shc.size());
+                if (hr_res < 1024)
+                    printf("      [note] backed off below the reference's 1024 floor to stay inside\n"
+                           "             --max-tokens %d; detail is reduced but the structure is whole\n",
+                           max_tok);
+                else if (max_tok > 0 && (int)shc.size() >= max_tok)
+                    printf("      [note] %d tokens is over --max-tokens %d at the backoff floor;\n"
+                           "             expect high VRAM and a slow HR flow\n", (int)shc.size(), max_tok);
                 break;
             }
             printf("      res%d (grid %d) -> %d tokens >= %d, backing off -128\n",

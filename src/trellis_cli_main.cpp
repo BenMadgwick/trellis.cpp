@@ -9,10 +9,15 @@ int main(int argc, char** argv) {
         trellis::print_usage(argv[0], /*server=*/false);
         return p.help ? 0 : 1;
     }
-    if (p.image.empty()) {
-        fprintf(stderr, "[trellis] no input image (give <image.png> or --image)\n");
+    // --load-vox resumes after DINOv3, and the cache carries the conditioning,
+    // so a resumed run genuinely has no use for the image.
+    if (p.image.empty() && p.load_vox.empty()) {
+        fprintf(stderr, "[trellis] no input image (give <image.png>, --image, or --load-vox CACHE)\n");
         trellis::print_usage(argv[0], /*server=*/false);
         return 1;
     }
+    if (!p.image.empty() && !p.load_vox.empty())
+        fprintf(stderr, "[trellis] --load-vox given: ignoring the input image "
+                        "(the cache already holds its conditioning)\n");
     return trellis_run(p);
 }

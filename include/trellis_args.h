@@ -83,6 +83,18 @@ struct TrellisParams {
     int  threads  = 0;          // CPU backend thread count; 0 = all cores
     float gss = 7.5f;           // sparse-structure guidance strength
     float gsh = 7.5f;           // shape-SLAT guidance strength
+    // Two-stage generation. The sparse structure decode finishes in ~1-2 s while
+    // the shape/texture/bake stages after it cost ~45-60 s, so a run whose voxel
+    // structure is already wrong is worth abandoning at that point -- on a shared
+    // GPU the saving is queue time for everyone else too.
+    //
+    // A resumed run needs NO image: stages [1] and [2] exist only to produce the
+    // DINOv3 conditioning, which the cache stores alongside the voxels.
+    bool vox_only = false;      // stop after the sparse-structure decode
+    std::string vox_render;     // write a 4-view voxel preview PNG here
+    std::string save_vox;       // write the resume cache here
+    std::string load_vox;       // resume from this cache, skipping stages [1]-[3]
+
     bool voxply = false;        // dump out/myvox.ply              (debug)
     bool dump_slat = false;     // dump /tmp/hr_slat.bin           (debug)
     bool dump_bg = false;       // also write the bg-removal cutout as <out>_cutout.png
