@@ -9,9 +9,13 @@
 //               [--save-stripped F] [--load-stripped F] cache after the strip
 //               [--faces N[,N,...]]                     one GLB per target
 //               [--normal-map] [--normal-space tangent|object] [--normal-search K]
+//               [--remesh-mode unsigned|signed5|interior|auto]  which field to contour
+//               [--sign-rays N] [--sign-dump F] [--no-cull] [--fill-hipoly P]
+//               [--remesh-project X] [--audit-visible]
 #include "uv_bake.h"
 #include "tri_bvh.h"
 #include "remesh_dc.h"
+#include "mesh_audit.h"
 #include "strip_interior.h"
 #include "shading.h"
 #include "mesh_glb.h"
@@ -30,16 +34,54 @@ static double now() {
 
 // boundary/non-manifold audit over the welded index space (positions assumed welded)
 #include <unordered_map>
-static void audit(const char* tag, const std::vector<int32_t>& faces) {
-    std::unordered_map<uint64_t,int> e;
+static size_t audit(const char* tag, const std::vector<int32_t>& faces) {
+    // count, plus a direction balance: each use of the edge contributes +1 when
+    // traversed low->high and -1 for high->low. Two faces sharing an edge are
+    // consistently wound exactly when they traverse it in OPPOSITE directions,
+    // i.e. balance 0. This is the A6 quantity, measured directly rather than
+    // inferred from how many faces clean_mesh's BFS decided to flip (that count
+    // is relative to an arbitrary per-patch seed, so on a mesh cut into many
+    // patches by boundary edges it lands near 50% whatever the winding is).
+    struct E { int count, bal; };
+    std::unordered_map<uint64_t,E> e;
     e.reserve(faces.size() * 2);
     const size_t F = faces.size() / 3;
     auto k = [](int a, int b){ if (a>b){int t=a;a=b;b=t;} return ((uint64_t)(uint32_t)a<<32)|(uint32_t)b; };
     for (size_t f = 0; f < F; ++f)
-        for (int j = 0; j < 3; ++j) e[k(faces[3*f+j], faces[3*f+(j+1)%3])]++;
-    size_t nb = 0, nm = 0;
-    for (auto& kv : e) { if (kv.second == 1) ++nb; else if (kv.second > 2) ++nm; }
-    printf("  [audit] %-22s F=%-9zu boundary_edges=%-7zu nonmanifold=%zu\n", tag, F, nb, nm);
+        for (int j = 0; j < 3; ++j) {
+            const int a = faces[3*f+j], b = faces[3*f+(j+1)%3];
+            E& v = e[k(a, b)];
+            ++v.count;
+            v.bal += a < b ? 1 : -1;
+        }
+    size_t nb = 0, nm = 0, n2 = 0, cons = 0;
+    for (auto& kv : e) {
+        if (kv.second.count == 1) ++nb;
+        else if (kv.second.count > 2) ++nm;
+        else { ++n2; if (kv.second.bal == 0) ++cons; }
+    }
+    printf("  [audit] %-22s F=%-9zu boundary_edges=%-7zu nonmanifold=%zu",
+           tag, F, nb, nm);
+    if (F) printf("  open/1k=%.2f", 1000.0 * (double)nb / (double)F);
+    if (n2) printf("  wound=%.2f%%", 100.0 * (double)cons / (double)n2);
+    printf("\n");
+    fflush(stdout);
+    return nb;
+}
+
+static void audit_visible(const char* tag, const std::vector<float>& verts,
+                          const std::vector<int32_t>& faces, int ndirs, int grid) {
+    const trellis::VisibleAudit a = trellis::visible_fraction(verts, faces, ndirs, grid);
+    printf("  [visible] %-20s faces %lld/%lld = %.4f   area %.4f", tag,
+           (long long)a.faces_hit, (long long)a.faces, a.face_frac(), a.area_frac());
+    // A ray marks at most one face, so on a mesh with millions of faces this
+    // saturates on the ray budget and reports rays/faces, not visibility. Say
+    // so rather than letting a low number read as "most of it is buried".
+    if (a.undersampled())
+        printf("   [LOWER BOUND: %lld rays landed on %lld faces, %.1f per face; raise --audit-grid]",
+               (long long)a.rays_hit, (long long)a.faces_hit,
+               a.faces_hit ? (double)a.rays_hit / (double)a.faces_hit : 0.0);
+    printf("\n");
     fflush(stdout);
 }
 
@@ -106,7 +148,23 @@ int main(int argc, char** argv) {
     std::vector<int> targets;
     const char* save_mesh = nullptr; const char* load_mesh = nullptr;
     const char* save_stripped = nullptr; const char* load_stripped = nullptr;
-    bool signed_remesh = false;
+    // Which field remesh_dc contours (see RemeshMode in remesh_dc.h). `auto` is
+    // Interior plus the output-audit fallback below; `interior` is Interior with
+    // no fallback, for experiments that need the failure to be visible.
+    trellis::RemeshMode rmode = trellis::RemeshMode::Interior;
+    bool mode_auto = true;
+    int sign_rays = 64;
+    const char* sign_dump = nullptr;
+    bool do_cull = true;
+    // Perimeter ceiling for the fan-fill on the HIGH-POLY. Holes wider than the
+    // band's own lip (2*eps ~ 3.9 mm) survive contouring as clean rims -- the
+    // dog's three paw holes are ~150 mm of perimeter each. Filling them here
+    // rather than after decimation means QEM is never forced to preserve rim
+    // vertices and the normal bake never sees a hole.
+    float fill_hipoly = 0.25f;
+    float remesh_project = 0.0f;
+    bool do_visible = false;
+    int vis_dirs = 512, vis_grid = 128;
     // Contouring grid resolution, independent of the dump's own res. The UDF is
     // evaluated from the mesh through a BVH, so a finer grid is simply more
     // samples of the same field -- and thin features are lost when the region
@@ -152,7 +210,23 @@ int main(int argc, char** argv) {
         else if (a == "--no-remesh") do_remesh = false;
         else if (a == "--band" && i+1 < argc) band = atoi(argv[++i]);
         else if (a == "--no-snap") do_snap = false;
-        else if (a == "--signed-remesh") signed_remesh = true;
+        else if (a == "--signed-remesh") { rmode = trellis::RemeshMode::Signed5; mode_auto = false; }
+        else if (a == "--remesh-mode" && i+1 < argc) {
+            const std::string m = argv[++i];
+            mode_auto = m == "auto";
+            if (m == "unsigned")      rmode = trellis::RemeshMode::Unsigned;
+            else if (m == "signed5")  rmode = trellis::RemeshMode::Signed5;
+            else if (m == "interior" || m == "auto") rmode = trellis::RemeshMode::Interior;
+            else { fprintf(stderr, "--remesh-mode: expected unsigned|signed5|interior|auto, got '%s'\n", m.c_str()); return 1; }
+        }
+        else if (a == "--sign-rays" && i+1 < argc) sign_rays = atoi(argv[++i]);
+        else if (a == "--sign-dump" && i+1 < argc) sign_dump = argv[++i];
+        else if (a == "--no-cull") do_cull = false;
+        else if (a == "--fill-hipoly" && i+1 < argc) fill_hipoly = (float)atof(argv[++i]);
+        else if (a == "--remesh-project" && i+1 < argc) remesh_project = (float)atof(argv[++i]);
+        else if (a == "--audit-visible") do_visible = true;
+        else if (a == "--audit-dirs" && i+1 < argc) vis_dirs = atoi(argv[++i]);
+        else if (a == "--audit-grid" && i+1 < argc) vis_grid = atoi(argv[++i]);
         else if (a == "--remesh-res" && i+1 < argc) remesh_res = atoi(argv[++i]);
         else if (a == "--fill-loop" && i+1 < argc) fill_loop = atoi(argv[++i]);
         else if (a == "--strip-interior") do_strip = true;
@@ -181,10 +255,11 @@ int main(int argc, char** argv) {
     // A normal bake against the unstripped shell samples buried, inward-facing
     // sheets over most of the surface; the result is noise that looks plausible
     // in the texture viewer. Refuse rather than produce it.
-    if (do_normal && !do_strip && !load_stripped && !signed_remesh) {
+    if (do_normal && !do_strip && !load_stripped && rmode == trellis::RemeshMode::Unsigned) {
         fprintf(stderr, "--normal-map requires --strip-interior (or --load-stripped): baking against\n"
                         "the four-sheet shell samples buried geometry and yields noise.\n"
-                        "--signed-remesh also satisfies this: it never builds the cover.\n");
+                        "--remesh-mode interior|auto|signed5 also satisfies this: none of them\n"
+                        "builds the cover in the first place.\n");
         return 1;
     }
 
@@ -244,6 +319,14 @@ int main(int argc, char** argv) {
     printf("  [fill %.1fs]\n", now()-t); t = now();
     audit("fill_small_holes", faces);
 
+    // Step 0. A coincident face pair is two crossings on every ray that meets
+    // it, so parity reads solid geometry as a hole. Must precede the BVH build.
+    if (rmode == trellis::RemeshMode::Interior || rmode == trellis::RemeshMode::Signed5) {
+        const int ndup = trellis::drop_duplicate_faces(faces);
+        printf("  [dedupe %.1fs] removed=%d\n", now()-t, ndup); t = now();
+        if (ndup) audit("drop_duplicate_faces", faces);
+    }
+
     trellis::TriBvh bvh = trellis::TriBvh::build(verts.data(), (int64_t)verts.size()/3,
                                                  faces.data(), (int64_t)faces.size()/3);
     printf("  [bvh %.1fs]\n", now()-t); t = now();
@@ -263,18 +346,54 @@ int main(int argc, char** argv) {
     if (do_remesh && !cached) {
         const int rres = remesh_res > 0 ? remesh_res : res;
         if (rres != res) printf("  remesh at grid %d (dump res %d)\n", rres, res);
-        rm = trellis::remesh_narrow_band_dc(verts.data(), (int64_t)verts.size()/3,
-                                            faces.data(), (int64_t)faces.size()/3, bvh, rres, band,
-                                            0.0f, signed_remesh);
-        printf("  [remesh %.1fs]\n", now()-t); t = now();
-        audit("remesh", rm.faces);
-        // match the CLI: clean degenerates/unify winding, drop floater components
-        if (rm.F() > 0) {
+        // Steps 3-6. Returns boundary edges on the finished high-poly, which is
+        // what the `auto` gate reads.
+        auto build = [&](trellis::RemeshMode m) -> size_t {
+            rm = trellis::remesh_narrow_band_dc(verts.data(), (int64_t)verts.size()/3,
+                                                faces.data(), (int64_t)faces.size()/3, bvh, rres, band,
+                                                remesh_project, m, sign_rays, sign_dump);
+            printf("  [remesh %.1fs]\n", now()-t); t = now();
+            audit("remesh", rm.faces);
+            if (rm.F() == 0) return 0;
+            // match the CLI: clean degenerates/unify winding, drop floater components
             trellis::clean_mesh(rm.V(), rm.faces);
             audit("clean_mesh", rm.faces);
-            int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
+            const int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
             printf("  [clean+drop %.1fs] dropped=%d\n", now()-t, ndrop); t = now();
-            audit("drop_components", rm.faces);
+            size_t nb = audit("drop_components", rm.faces);
+            if (m == trellis::RemeshMode::Unsigned) return nb;
+            // Step 5. Round holes wider than the band's lip come through as
+            // clean rims; fan them here so QEM and the normal bake see a closed
+            // surface. (Slits narrower than 2*eps sealed themselves under the
+            // lip, which is why the unsigned path never needed this.)
+            if (fill_hipoly > 0.0f) {
+                const int nfill = trellis::fill_holes(rm.verts, rm.faces, fill_hipoly);
+                printf("  [fill_holes %.1fs] filled=%d (max perimeter %.3f)\n", now()-t, nfill, fill_hipoly); t = now();
+                nb = audit("fill_holes", rm.faces);
+            }
+            // Step 6. Only meaningful now: the output is closed, so its cavities
+            // are genuinely enclosed rather than being the exterior in disguise.
+            if (do_cull) {
+                trellis::cull_enclosed_components(rm.verts, rm.faces, 256);
+                printf("  [cull %.1fs]\n", now()-t); t = now();
+                nb = audit("cull", rm.faces);
+            }
+            return nb;
+        };
+        const size_t nb = build(rmode);
+        // The gate the design puts on the OUTPUT rather than the input: the only
+        // failure modes Interior has are closed artefacts, so an input predictor
+        // would be guessing at something the output states directly.
+        if (mode_auto && rmode != trellis::RemeshMode::Unsigned) {
+            const size_t nf = rm.faces.size() / 3;
+            const double open1k = nf ? 1000.0 * (double)nb / (double)nf : 1e9;
+            if (nf < 10000 || open1k > 5.0) {
+                fprintf(stderr, "  [remesh] interior mode failed (faces=%zu, open/1k=%.2f); "
+                                "falling back to unsigned + strip\n", nf, open1k);
+                rm = trellis::Mesh();
+                build(trellis::RemeshMode::Unsigned);
+                do_strip = true;
+            }
         }
     }
     std::vector<float>& sverts = rm.F() > 0 ? rm.verts : verts;
@@ -303,13 +422,23 @@ int main(int argc, char** argv) {
         save_mesh_bin(save_stripped, sverts, sfaces, "post-strip mesh");
     }
 
+    // Triangle-budget efficiency of the thing we are about to spend the budget
+    // on. Run before the --no-bake early return, so a measurement-only sweep
+    // (which is exactly how this number gets collected) still reports it.
+    if (do_visible) { audit_visible("high-poly", sverts, sfaces, vis_dirs, vis_grid); t = now(); }
+
     if (!do_bake && targets.size() <= 1) {
         // nothing past this point is needed when the run exists only to populate caches
         std::vector<float> dv, dp; std::vector<int32_t> df;
         if (decim > 0) trellis::decimate_cluster(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, {}, decim, dv, df, dp);
         else if (decim == 0) { dv = sverts; df = sfaces; }
         else trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, targets[0], dv, df);
-        printf("  [decimate %.1fs]\n", now()-t);
+        printf("  [decimate %.1fs]\n", now()-t); t = now();
+        if (do_visible) {
+            char tag[32];
+            std::snprintf(tag, sizeof(tag), "tier %d", targets[0]);
+            audit_visible(tag, dv, df, vis_dirs, vis_grid);
+        }
         printf("(--no-bake) done\n");
         return 0;
     }
@@ -373,6 +502,16 @@ int main(int argc, char** argv) {
             audit("post-decimate", df);
         }
         printf("  [decimate %.1fs]\n", now()-t); t = now();
+        if (do_visible) {
+            char tag[32];
+            std::snprintf(tag, sizeof(tag), "tier %d", target);
+            audit_visible(tag, dv, df, vis_dirs, vis_grid);
+            t = now();
+        }
+        // Geometry-only sweep: the per-tier audits above are the A5/A6 evidence
+        // and cost seconds, while a bake costs minutes. Without this, --no-bake
+        // only did anything for a single target.
+        if (!do_bake) continue;
 
         trellis::BakedMesh bm = boxuv
             ? trellis::uv_box_project(dv, (int)dv.size()/3, df, (int)df.size()/3, no_vp, atlas, &vox)

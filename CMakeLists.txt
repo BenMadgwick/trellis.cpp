@@ -108,6 +108,7 @@ add_library(trellis_core STATIC
   src/remesh_dc.cpp
   src/decimate_qem.cpp
   src/strip_interior.cpp
+  src/mesh_audit.cpp
 )
 target_include_directories(trellis_core PUBLIC include ${GGML_DIR}/include ${CMAKE_SOURCE_DIR}/thirdparty/stb ${CMAKE_SOURCE_DIR}/thirdparty/xatlas ${CMAKE_SOURCE_DIR}/thirdparty/meshoptimizer ${CMAKE_SOURCE_DIR}/thirdparty/fqms)
 target_compile_definitions(trellis_core PRIVATE TRELLIS_GIT_COMMIT="${TRELLIS_GIT_COMMIT}" TRELLIS_GIT_DIRTY=${TRELLIS_GIT_DIRTY} TRELLIS_BUILD_TIMESTAMP="${TRELLIS_BUILD_TIMESTAMP_UTC}" TRELLIS_APP_VERSION="${TRELLIS_APP_VERSION}")
@@ -335,6 +336,10 @@ set_target_properties(trellis-test-c2s PROPERTIES BUILD_RPATH "${GGML_RPATH}")
 add_executable(trellis-test-sparse-degenerate src/test_sparse_degenerate.cpp)
 target_link_libraries(trellis-test-sparse-degenerate PRIVATE trellis_core)
 set_target_properties(trellis-test-sparse-degenerate PROPERTIES BUILD_RPATH "${GGML_RPATH}")
+
+add_executable(trellis-test-mesh-stage src/test_mesh_stage.cpp)
+target_link_libraries(trellis-test-mesh-stage PRIVATE trellis_core)
+set_target_properties(trellis-test-mesh-stage PROPERTIES BUILD_RPATH "${GGML_RPATH}")
 
 add_executable(trellis-test-shape-dec src/test_shape_dec.cpp)
 target_link_libraries(trellis-test-shape-dec PRIVATE trellis_core)

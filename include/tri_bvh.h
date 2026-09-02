@@ -28,6 +28,24 @@ public:
 
     Hit closest(const float p[3], float max_dist = 1e30f) const;
     RayHit ray(const float org[3], const float dir[3], float max_t = 1e30f) const;
+
+    // How many triangles the ray meets in (1e-7, max_t]. ONE traversal: unlike
+    // ray(), nothing is pruned by a nearest hit, so every node whose slab
+    // interval overlaps the ray is visited and every triangle in it tested.
+    //
+    // This is the parity primitive. The old parity_sign() answered the same
+    // question by calling ray() in a restart loop -- one full traversal per
+    // crossing, plus an epsilon nudge past each hit that is simultaneously too
+    // large for a thin wall and too small for a coincident pair. Counting in a
+    // single descent is both faster and exact.
+    //
+    // Two-sided, like ray(): parity counts crossings and must not care which way
+    // a triangle faces. That is the whole point -- the decoder mesh's winding is
+    // a fixed-table patchwork with no global orientation (~16-20% of shared
+    // edges disagree with their neighbour), so any method that reads a sign off
+    // the input is answering noise.
+    int count_hits(const float org[3], const float dir[3], float max_t) const;
+
     bool empty() const { return nodes_.empty(); }
 
 private:

@@ -12,6 +12,7 @@
 #include "uv_bake.h"
 #include "tri_bvh.h"
 #include "remesh_dc.h"
+#include "mesh_audit.h"
 #include "strip_interior.h"
 #include "shading.h"
 #include "stb_image_write.h"
@@ -23,6 +24,7 @@
 #include <string>
 #include <chrono>
 #include <set>
+#include <unordered_map>
 #include <array>
 #include <cmath>
 
@@ -40,6 +42,22 @@ static void slat_stats(const char* tag, const vector<float>& v) {
     size_t n = v.size() - bad; double mean = n ? s / n : 0, var = n ? s2 / n - mean * mean : 0;
     printf("      [stats] %s n=%zu mean=%.4f std=%.4f min=%.3f max=%.3f nan/inf=%zu\n",
            tag, v.size(), mean, var > 0 ? std::sqrt(var) : 0.0, mn, mx, bad);
+}
+
+// Boundary edges per 1000 faces over the welded index space. The `auto` mode's
+// gate: it reads the finished output rather than predicting from the input,
+// because Interior's only failure modes show up there.
+static double open_per_1k(const std::vector<int32_t>& faces) {
+    const size_t F = faces.size() / 3;
+    if (F == 0) return 1e9;
+    std::unordered_map<uint64_t,int> e;
+    e.reserve(F * 2);
+    auto k = [](int a, int b){ if (a>b){int t=a;a=b;b=t;} return ((uint64_t)(uint32_t)a<<32)|(uint32_t)b; };
+    for (size_t f = 0; f < F; ++f)
+        for (int j = 0; j < 3; ++j) e[k(faces[3*f+j], faces[3*f+(j+1)%3])]++;
+    size_t nb = 0;
+    for (auto& kv : e) if (kv.second == 1) ++nb;
+    return 1000.0 * (double)nb / (double)F;
 }
 
 static const float SHAPE_MEAN[32]={0.781296f,0.018091f,-0.495192f,-0.558457f,1.060530f,0.093252f,1.518149f,-0.933218f,-0.732996f,2.604095f,-0.118341f,-2.143904f,0.495076f,-2.179512f,-2.130751f,-0.996944f,0.261421f,-2.217463f,1.260067f,-0.150213f,3.790713f,1.481266f,-1.046058f,-1.523667f,-0.059621f,2.220780f,1.621212f,0.877230f,0.567247f,-3.175944f,-3.186688f,1.578665f};
@@ -375,6 +393,21 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         trellis::weld_vertices(mesh.verts, mesh.faces, colors.empty() ? nullptr : &colors,
                                1.0f / ((float)so.res * 8.0f));
         trellis::fill_small_holes(mesh.faces);
+        const trellis::RemeshMode rmode =
+              cfg.remesh_mode == "unsigned" ? trellis::RemeshMode::Unsigned
+            : cfg.remesh_mode == "signed5"  ? trellis::RemeshMode::Signed5
+                                            : trellis::RemeshMode::Interior;
+        const bool mode_auto = cfg.remesh_mode == "auto";
+        // The mode actually built, and whether the strip is needed: both can
+        // change under the `auto` fallback, and `cfg` is const.
+        trellis::RemeshMode final_mode = rmode;
+        bool want_strip = cfg.strip_interior;
+        // A coincident face pair counts as two crossings, so parity reads solid
+        // geometry as a hole. Must run before the BVH the parity test uses.
+        if (rmode != trellis::RemeshMode::Unsigned) {
+            const int ndup = trellis::drop_duplicate_faces(mesh.faces);
+            if (ndup) { printf("  dedupe: dropped %d duplicate faces\n", ndup); fflush(stdout); }
+        }
         // Reference production pipeline: rebuild the noisy dual-grid mesh as
         // the narrow-band offset shell (watertight manifold), then quadric
         // simplify to the face target. The BVH over the original hole-filled
@@ -388,19 +421,48 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // scales with resolution to keep the offset resolution-independent (512->1,
         // 1024->2, 1536->3); an explicit --band / per-request band forces that value.
         int remesh_band = cfg.band > 0 ? cfg.band : std::max(1, so.res / 512);
-        trellis::Mesh rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(),
-                                                          mesh.faces.data(), mesh.F(),
-                                                          bvh, so.res, remesh_band);
+        trellis::Mesh rm;
         // Clean the narrow-band DC output (drop degenerate faces, unify winding), then drop
         // decode floaters (the reference is a single watertight component; ours shattered into
         // 50+ pieces). The faithful QEM simplifier below handles surface smoothing via its
         // quadric + skinny-triangle cost, so no Taubin pre-pass is needed (and none is applied,
         // which keeps the mesh aligned to the voxel PBR volume for correct texture sampling).
-        if (rm.F() > 0) {
+        auto build_remesh = [&](trellis::RemeshMode m) -> double {
+            rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(),
+                                                mesh.faces.data(), mesh.F(),
+                                                bvh, so.res, remesh_band,
+                                                cfg.remesh_project, m, cfg.sign_rays);
+            if (rm.F() == 0) return 1e9;
             trellis::clean_mesh(rm.V(), rm.faces);
             int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
             printf("  remesh postproc: dropped %d floater comps -> V=%d F=%d\n", ndrop, rm.V(), rm.F());
             fflush(stdout);
+            if (m == trellis::RemeshMode::Unsigned) return 0.0;
+            // Round holes wider than the band's own lip survive contouring as
+            // clean rims; fan them now so QEM is never forced to preserve rim
+            // vertices and the normal bake never sees a hole.
+            if (cfg.fill_hipoly > 0.0f) {
+                const int nfill = trellis::fill_holes(rm.verts, rm.faces, cfg.fill_hipoly);
+                if (nfill) { printf("  remesh postproc: fan-filled %d high-poly holes\n", nfill); fflush(stdout); }
+            }
+            // Meaningful only on a closed output: its cavities are genuinely
+            // enclosed, rather than being the exterior seen from between two
+            // sheets of a double cover.
+            if (cfg.cull) trellis::cull_enclosed_components(rm.verts, rm.faces, 256);
+            return open_per_1k(rm.faces);
+        };
+        const double open1k = build_remesh(rmode);
+        if (mode_auto && rmode != trellis::RemeshMode::Unsigned) {
+            const size_t nf = rm.faces.size() / 3;
+            if (nf < 10000 || open1k > 5.0) {
+                printf("  remesh: interior mode failed (faces=%zu, open/1k=%.2f); "
+                       "falling back to unsigned + strip\n", nf, open1k);
+                fflush(stdout);
+                rm = trellis::Mesh();
+                build_remesh(trellis::RemeshMode::Unsigned);
+                final_mode = trellis::RemeshMode::Unsigned;
+                want_strip = true;
+            }
         }
         std::vector<float>& sverts = rm.F() > 0 ? rm.verts : mesh.verts;
         std::vector<int32_t>& sfaces = rm.F() > 0 ? rm.faces : mesh.faces;
@@ -413,9 +475,16 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // being crumpled where the offset self-intersects, they read to a
         // quadric decimator as detail worth keeping and take most of the budget.
         // See strip_interior.h. No-op on meshes that have no buried sheet.
-        if (cfg.strip_interior) {
+        // Only the unsigned path has buried sheets to strip. Interior never
+        // builds them, and cull_enclosed_components has already removed any
+        // genuinely enclosed component by a topological test rather than by
+        // hunting for a trough in a depth histogram.
+        if (want_strip && final_mode == trellis::RemeshMode::Unsigned) {
             trellis::StripOpts so2;
             trellis::strip_interior(sverts, sfaces, so2);
+        } else if (want_strip) {
+            printf("      --strip-interior skipped: --remesh-mode %s has no buried sheet\n",
+                   cfg.remesh_mode.c_str());
         }
         std::vector<float> dv, dp; std::vector<int32_t> df;
         if (cfg.decim > 0) {
@@ -450,10 +519,14 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         trellis::NormalSrc nsrc;
         trellis::TriBvh hi_bvh;
         std::vector<float> hi_nrm;
-        const bool do_normal = cfg.normal_map && cfg.strip_interior;
-        if (cfg.normal_map && !cfg.strip_interior)
-            printf("      --normal-map ignored: it requires --strip-interior (baking against the\n"
-                   "      four-sheet shell samples buried geometry and yields noise)\n");
+        // The bake needs a single-cover high-poly. Every mode but Unsigned gives
+        // one by construction; Unsigned needs the strip to have run.
+        const bool single_cover = final_mode != trellis::RemeshMode::Unsigned || want_strip;
+        const bool do_normal = cfg.normal_map && single_cover;
+        if (cfg.normal_map && !single_cover)
+            printf("      --normal-map ignored: --remesh-mode unsigned needs --strip-interior\n"
+                   "      (baking against the four-sheet shell samples buried geometry and\n"
+                   "      yields noise). --remesh-mode auto avoids this entirely.\n");
         if (do_normal) {
             hi_bvh = trellis::TriBvh::build(sverts.data(), (int64_t)sverts.size()/3,
                                             sfaces.data(), (int64_t)sfaces.size()/3);

@@ -276,6 +276,21 @@ def geometry_metrics(P, F):
     m["welded_watertight"] = wb == 0 and wnm == 0
     m["_W"] = W
 
+    # Signed volume by the divergence theorem, over the WELDED indices (the raw
+    # buffer is split at UV seams, which leaves every chart a separate open
+    # shell and the sum meaningless).
+    #
+    # Only interpretable on a closed surface, which is the point: with a single
+    # cover the sign is a global statement about which way the mesh faces, and
+    # it must be POSITIVE at every tier. On the unsigned double cover it is not
+    # a solidity test at all -- it measures where the object sits relative to
+    # the origin, which is why the table and jerry can decode negative.
+    PW = np.zeros((m["welded_vertices"], 3), dtype=np.float64)
+    PW[W] = P
+    A, B, C3 = PW[FW[:, 0]], PW[FW[:, 1]], PW[FW[:, 2]]
+    m["signed_volume"] = float(np.einsum("ij,ij->i", A, np.cross(B, C3)).sum() / 6.0)
+    m["volume_sign_ok"] = m["signed_volume"] > 0.0
+
     m["bbox_min"] = P.min(0)
     m["bbox_max"] = P.max(0)
     C = P - P.mean(0)
@@ -580,6 +595,10 @@ def print_report(r):
                 "yes" if g["welded_watertight"] else "no",
             )
         )
+        print(
+            "  signed volume (welded): %+.3f cm3  outward: %s"
+            % (g["signed_volume"] * 1e6, "yes" if g["volume_sign_ok"] else "NO (inverted)")
+        )
         print("  bbox min: %s  max: %s" % (f3(g["bbox_min"]), f3(g["bbox_max"])))
         print("  principal extents: %s" % f3(g["principal_extents"]))
     else:
@@ -639,7 +658,7 @@ def print_report(r):
     print()
 
 
-def cmp_val(r, keys, fmt="%s"):
+def cmp_val(r, keys, fmt="%s", scale=1.0):
     v = r
     for k in keys:
         if v is None:
@@ -648,7 +667,7 @@ def cmp_val(r, keys, fmt="%s"):
     if v is None:
         return "n/a"
     if isinstance(v, float):
-        return fmt % v
+        return fmt % (v * scale)
     return str(v)
 
 
@@ -663,6 +682,7 @@ def print_comparison(results):
         ("winding %", lambda r: cmp_val(r, ["geo", "winding_pct"], "%.2f")),
         ("watertight (index)", lambda r: cmp_val(r, ["geo", "watertight"])),
         ("watertight (welded)", lambda r: cmp_val(r, ["geo", "welded_watertight"])),
+        ("signed vol cm3", lambda r: cmp_val(r, ["geo", "signed_volume"], "%+.3f", 1e6)),
         ("charts", lambda r: cmp_val(r, ["uv", "charts"])),
         ("zero-UV faces %", lambda r: cmp_val(r, ["uv", "zero_uv_pct"], "%.2f")),
         ("texel dens p50", lambda r: cmp_val(r, ["uv", "density", "p50"], "%.4g")),

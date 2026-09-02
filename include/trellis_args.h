@@ -44,11 +44,26 @@ struct TrellisParams {
                                 //   speckle (issue #22). >0 forces that width (e.g. 1 for
                                 //   the thin-wall reference look, 2 for a thicker shell).
     int  faces    = -1;         // QEM face budget            (-1 => per-cascade default)
-    bool strip_interior = false; // drop buried sheets before simplifying
-    bool normal_map = false;    // bake a tangent-space normal map from the stripped
-                                //   high-poly. Requires strip_interior: against the
-                                //   four-sheet shell the bake samples buried,
-                                //   inward-facing geometry and returns noise.
+    // Which field remesh_dc contours (see RemeshMode in remesh_dc.h):
+    //   "auto"     Interior, falling back to unsigned+strip if the output audit
+    //              says it failed. The default: Interior's only failure modes
+    //              are closed artefacts, so the audit is direct evidence rather
+    //              than the input-side guess a router would have to make.
+    //   "interior" Interior with no fallback (experiments)
+    //   "signed5"  the old parity-product path, for A/B
+    //   "unsigned" the reference double cover; needs --strip-interior
+    std::string remesh_mode = "auto";
+    int   sign_rays = 64;       // max parity directions per grid vertex (8 cast first)
+    bool  cull = true;          // drop components no ray can escape from
+    float fill_hipoly = 0.25f;  // fan-fill perimeter ceiling on the high-poly (0 = off)
+    float remesh_project = 0.0f;// lerp dual verts onto the input surface (see remesh_dc.h)
+    bool strip_interior = false; // drop buried sheets before simplifying (unsigned path only)
+    bool normal_map = false;    // bake a tangent-space normal map from the high-poly.
+                                //   Needs a SINGLE-cover source: any remesh mode but
+                                //   "unsigned" gives one by construction; on the
+                                //   unsigned path it still requires strip_interior,
+                                //   since against the four-sheet shell the bake
+                                //   samples buried, inward-facing geometry.
     float normal_search = 2.0f; // ray/closest-point bound, in multiples of the local
                                 //   low-poly edge length (scales with the face target)
     float normal_cap_shells = 4.0f; // ceiling on the normal-bake search, in offset

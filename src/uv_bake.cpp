@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <memory>
 #include <queue>
@@ -505,6 +506,42 @@ int weld_vertices(std::vector<float>& verts, std::vector<int32_t>& faces, std::v
     return welded;
 }
 
+int drop_duplicate_faces(std::vector<int32_t>& faces) {
+    const size_t F = faces.size() / 3;
+    if (F == 0) return 0;
+    // Sorted triple -> 96-bit key. Vertex indices are int32 and the meshes here
+    // run to ~15 M vertices, so pack the two smallest into a uint64 and keep the
+    // largest alongside rather than risking a lossy 64-bit hash of all three.
+    struct Key {
+        uint64_t lo; int32_t hi;
+        bool operator==(const Key& o) const { return lo == o.lo && hi == o.hi; }
+    };
+    struct KeyHash {
+        size_t operator()(const Key& k) const {
+            uint64_t z = k.lo ^ ((uint64_t)(uint32_t)k.hi * 0x9E3779B97F4A7C15ull);
+            z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+            z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+            return (size_t)(z ^ (z >> 31));
+        }
+    };
+    std::unordered_set<Key, KeyHash> seen;
+    seen.reserve(F * 2);
+    std::vector<int32_t> kept;
+    kept.reserve(faces.size());
+    for (size_t f = 0; f < F; ++f) {
+        int32_t a = faces[3*f], b = faces[3*f+1], c = faces[3*f+2];
+        if (a > b) std::swap(a, b);
+        if (b > c) std::swap(b, c);
+        if (a > b) std::swap(a, b);
+        const Key k{ ((uint64_t)(uint32_t)a << 32) | (uint32_t)b, c };
+        if (!seen.insert(k).second) continue;
+        kept.push_back(faces[3*f]); kept.push_back(faces[3*f+1]); kept.push_back(faces[3*f+2]);
+    }
+    const int removed = (int)(F - kept.size() / 3);
+    faces.swap(kept);
+    return removed;
+}
+
 void clean_mesh(int V, std::vector<int32_t>& faces) {
     (void)V;
     // 1. drop degenerate faces (a repeated vertex -> zero area, blocks collapse)
@@ -526,6 +563,40 @@ void clean_mesh(int V, std::vector<int32_t>& faces) {
     };
     for (int f = 0; f < F; ++f)
         for (int j = 0; j < 3; ++j) ef[ek(faces[3*f+j], faces[3*f+(j+1)%3])].push_back(f);
+    // Is it already consistently wound? Two faces sharing an edge agree exactly
+    // when they traverse it in opposite directions.
+    //
+    // The BFS below picks an arbitrary orientation per PATCH, from whichever
+    // face it happened to seed on, and patches are bounded by boundary and
+    // non-manifold edges. On a torn asset that is thousands of patches, so it
+    // flips ~half of them for no reason and can only lose ground: measured on
+    // the jerry can, remesh_dc's Interior output arrives 100.00% consistent and
+    // came out of here at 99.98%, with 7,346,417 faces needlessly flipped.
+    //
+    // Unifying an already-unified mesh has nothing to gain, so don't.
+    {
+        int64_t n2 = 0, cons = 0;
+        for (int f = 0; f < F; ++f)
+            for (int j = 0; j < 3; ++j) {
+                const int a = faces[3*f+j], b = faces[3*f+(j+1)%3];
+                if (a >= b) continue;                    // count each undirected edge once
+                auto it = ef.find(ek(a, b));
+                if (it == ef.end() || it->second.size() != 2) continue;
+                ++n2;
+                // Consistent iff the OTHER face traverses b->a.
+                const int g = it->second[0] == f ? it->second[1] : it->second[0];
+                bool same = false;
+                for (int k = 0; k < 3; ++k)
+                    if (faces[3*g+k] == a && faces[3*g+(k+1)%3] == b) { same = true; break; }
+                if (!same) ++cons;
+            }
+        if (n2 && cons >= (int64_t)(0.999 * (double)n2)) {
+            printf("    [clean] faces=%d, winding already %.2f%% consistent over %lld edges; "
+                   "not unifying\n", F, 100.0 * (double)cons / (double)n2, (long long)n2);
+            fflush(stdout);
+            return;
+        }
+    }
     // 3. BFS flood; flip faces to a consistent winding across manifold (exactly-2-face) edges.
     // Non-manifold / boundary edges are not crossed, so orientation stays locally consistent.
     std::vector<char> vis(F, 0), flip(F, 0);

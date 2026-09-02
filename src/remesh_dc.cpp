@@ -42,6 +42,107 @@ void parallel_for(int64_t n, const std::function<void(int64_t, int64_t)>& fn) {
     for (auto& t : ts) t.join();
 }
 
+inline uint64_t splitmix64(uint64_t& s) {
+    uint64_t z = (s += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+inline float splitmix_unit(uint64_t& s) { return (float)((splitmix64(s) >> 11) * 0x1.0p-53); }
+
+// Spherical Fibonacci directions: near-uniform on the sphere for any N, and
+// generated rather than tabulated so the ray budget is a runtime knob.
+void fib_sphere(int n, std::vector<float>& out) {
+    out.resize((size_t)n * 3);
+    const float ga = 3.14159265358979f * (3.0f - 2.2360679774997896f);   // pi*(3-sqrt5)
+    for (int i = 0; i < n; ++i) {
+        const float z = 1.0f - (2.0f * i + 1.0f) / (float)n;
+        const float r = std::sqrt(std::max(0.0f, 1.0f - z * z));
+        const float phi = (float)i * ga;
+        out[3*i]   = r * std::cos(phi);
+        out[3*i+1] = r * std::sin(phi);
+        out[3*i+2] = z;
+    }
+}
+
+// The 8 cube diagonals: the cheap first pass. Unanimity among 8 independent
+// directions settles the vast majority of vertices, which are nowhere near a
+// hole or a grazing configuration.
+static const float D8[8][3] = {
+    { 0.5773503f,  0.5773503f,  0.5773503f}, { 0.5773503f,  0.5773503f, -0.5773503f},
+    { 0.5773503f, -0.5773503f,  0.5773503f}, { 0.5773503f, -0.5773503f, -0.5773503f},
+    {-0.5773503f,  0.5773503f,  0.5773503f}, {-0.5773503f,  0.5773503f, -0.5773503f},
+    {-0.5773503f, -0.5773503f,  0.5773503f}, {-0.5773503f, -0.5773503f, -0.5773503f},
+};
+
+// Uniformly random unit quaternion from a seed (Shoemake), as a rotation matrix.
+// Every vertex gets its OWN rotation. Fixed directions shared across vertices
+// make grazing errors CORRELATED: the five-direction sign miscounted along the
+// whole of the dog's back, where the surface lies near-tangent to one of them,
+// and the result was a hole down the spine rather than scattered specks. With a
+// per-vertex rotation the same grazing hits one vertex and not its neighbour,
+// so the error stays a speck -- and in Interior mode a speck is a closed bump.
+void random_rotation(uint64_t seed, float R[9]) {
+    uint64_t s = seed * 0xD1B54A32D192ED03ull + 0x9E3779B97F4A7C15ull;
+    const float u1 = splitmix_unit(s), u2 = splitmix_unit(s), u3 = splitmix_unit(s);
+    const float s1 = std::sqrt(1.0f - u1), s2 = std::sqrt(u1);
+    const float tau = 6.28318530717959f;
+    const float x = s1 * std::sin(tau * u2), y = s1 * std::cos(tau * u2);
+    const float z = s2 * std::sin(tau * u3), w = s2 * std::cos(tau * u3);
+    R[0] = 1-2*(y*y+z*z); R[1] = 2*(x*y-z*w);   R[2] = 2*(x*z+y*w);
+    R[3] = 2*(x*y+z*w);   R[4] = 1-2*(x*x+z*z); R[5] = 2*(y*z-x*w);
+    R[6] = 2*(x*z-y*w);   R[7] = 2*(y*z+x*w);   R[8] = 1-2*(x*x+y*y);
+}
+
+// Fraction of directions along which the input surface is crossed an odd number
+// of times. 1 deep inside a closed region, 0 outside it, and intermediate only
+// near a hole -- where the true answer is genuinely undefined and a cap belongs.
+//
+// Orientation-free by construction: it counts crossings and never reads a
+// normal, which is the only reason it survives an input whose winding is a
+// patchwork (see RemeshMode in the header).
+float parity_fraction(const TriBvh& bvh, const float p[3], uint64_t seed,
+                      const std::vector<float>& dirs, float reach, int64_t* rays_out) {
+    float R[9];
+    random_rotation(seed, R);
+    auto rot = [&R](const float* d, float* o) {
+        o[0] = R[0]*d[0] + R[1]*d[1] + R[2]*d[2];
+        o[1] = R[3]*d[0] + R[4]*d[1] + R[5]*d[2];
+        o[2] = R[6]*d[0] + R[7]*d[1] + R[8]*d[2];
+    };
+    int odd = 0;
+    for (int i = 0; i < 8; ++i) {
+        float d[3];
+        rot(D8[i], d);
+        odd += bvh.count_hits(p, d, reach) & 1;
+    }
+    if (odd == 0) { if (rays_out) *rays_out += 8; return 0.0f; }   // unanimously outside
+    if (odd == 8) { if (rays_out) *rays_out += 8; return 1.0f; }   // unanimously inside
+    // Escalate in blocks of 8 rather than jumping straight to the full budget.
+    // The verdict is a comparison against F = 0.5, so once a supermajority is
+    // established the remaining rays cannot change it -- and paying for them is
+    // what made this stage expensive on a torn asset, where the 8 diagonals
+    // disagree over large regions rather than only at holes.
+    //
+    // The stop rule (F <= 1/8 or F >= 7/8 with at least 16 samples) keeps the
+    // full budget exactly where the design wants it: vertices whose true F is
+    // near 0.5, i.e. in the plane of a hole, where a cap belongs either way.
+    const int extra = (int)(dirs.size() / 3);
+    int n = 8;
+    for (int b = 0; b < extra; b += 8) {
+        const int e = std::min(extra, b + 8);
+        for (int i = b; i < e; ++i) {
+            float d[3];
+            rot(&dirs[3*i], d);
+            odd += bvh.count_hits(p, d, reach) & 1;
+        }
+        n = 8 + e;
+        if (n >= 16 && (odd * 8 <= n || odd * 8 >= 7 * n)) break;
+    }
+    if (rays_out) *rays_out += n;
+    return (float)odd / (float)n;
+}
+
 }  // namespace
 
 namespace {
@@ -164,9 +265,10 @@ struct PseudoNormals {
 
 Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* ifaces, int64_t iF,
                            const TriBvh& bvh, int res, int band, float project_back,
-                           bool signed_field) {
+                           RemeshMode mode, int sign_rays, const char* sign_dump) {
     Mesh out;
     if (iF == 0 || bvh.empty() || res <= 0) return out;
+    const bool signed_field = mode == RemeshMode::Signed5;
 
     // Reference domain: the world cube is inflated by (res+3·band)/res so the
     // offset shell never touches the boundary; eps is the offset distance.
@@ -179,6 +281,16 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
     PseudoNormals pn;
     if (signed_field) pn.build(iverts, iV, ifaces, iF);
     const float keep = 0.87f * cell;
+
+    // Interior mode: kappa scales the parity term to [-eps, +eps], commensurate
+    // with the UDF term at the band edge. Any value in [eps, 4*eps] gives the
+    // same zero set -- kappa only shapes how a bump's crossing interpolates.
+    const float kappa = 2.0f * eps;
+    const float reach = 4.0f * scale;      // the inflated domain diagonal is < 2*scale
+    std::vector<float> extra_dirs;
+    if (mode == RemeshMode::Interior && sign_rays > 8) fib_sphere(sign_rays - 8, extra_dirs);
+    std::atomic<int64_t> n_parity{0};
+    std::atomic<int64_t> n_rays{0};
 
     // Candidate cells: conservative dilation of every triangle's AABB by the
     // band-plus-crossing radius, marked in a res^3 bitset.
@@ -297,7 +409,13 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
         }
     const int64_t Nv = (int64_t)vcoord.size() / 3;
     std::vector<float> fvert((size_t)Nv);
+    // R1 diagnostic: x, y, z, udf, F per vertex where parity was evaluated.
+    // F = -1 marks "not evaluated" (the UDF term decided it) and is filtered out
+    // when the file is written.
+    std::vector<float> dump;
+    if (sign_dump && mode == RemeshMode::Interior) dump.assign((size_t)Nv * 5, -1.0f);
     parallel_for(Nv, [&](int64_t b, int64_t e) {
+        int64_t local_parity = 0, local_rays = 0;
         for (int64_t i = b; i < e; ++i) {
             const float p[3] = { ((float)vcoord[3*i]   / res - 0.5f) * scale,
                                  ((float)vcoord[3*i+1] / res - 0.5f) * scale,
@@ -306,19 +424,50 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
             // (f changes at most one cell-length per edge), so this bound
             // never clips a value that feeds the crossing interpolation.
             const TriBvh::Hit h = bvh.closest(p, lvl + 2 * cell);
-            if (h.face < 0) {
+            const bool far = h.face < 0;
+            const float d = far ? 2 * cell : std::sqrt(h.dist2) - lvl;
+            if (mode != RemeshMode::Interior) {
                 // Past the search radius. Active cells hug the surface and their
                 // corners sit within a cell of it, so this is the far field:
                 // positive either way.
-                fvert[i] = 2 * cell;
-            } else {
-                const float d = std::sqrt(h.dist2) - lvl;
-                fvert[i] = signed_field
-                    ? d * PseudoNormals::parity_sign(bvh, p, 4.0f * scale)
-                    : d;
+                fvert[i] = far ? 2 * cell : (signed_field ? d * PseudoNormals::parity_sign(bvh, p, reach) : d);
+                continue;
             }
+            // Deep inside the band the UDF term already binds (f < 0 whichever
+            // way parity goes), so skip the rays entirely. This is most of the
+            // vertices, and it is what keeps the stage at unsigned-mode cost.
+            if (!far && d < -cell) { fvert[i] = d; continue; }
+            const uint64_t seed = key3(vcoord[3*i], vcoord[3*i+1], vcoord[3*i+2]);
+            const float F = parity_fraction(bvh, p, seed, extra_dirs, reach, &local_rays);
+            ++local_parity;
+            if (!dump.empty()) {
+                dump[5*i] = p[0]; dump[5*i+1] = p[1]; dump[5*i+2] = p[2];
+                dump[5*i+3] = far ? lvl + 2 * cell : std::sqrt(h.dist2);
+                dump[5*i+4] = F;
+            }
+            // The far field is only "positive either way" for an UNSIGNED field.
+            // It is exactly where a solid's interior lives, and the reason the
+            // eps level set doubles back on itself; parity is what tells the two
+            // apart.
+            if (far) { fvert[i] = F > 0.5f ? -eps : 2 * cell; continue; }
+            fvert[i] = std::min(d, kappa * (0.5f - F));
+        }
+        if (local_parity) {
+            n_parity.fetch_add(local_parity, std::memory_order_relaxed);
+            n_rays.fetch_add(local_rays, std::memory_order_relaxed);
         }
     });
+    if (!dump.empty()) {
+        FILE* df = fopen(sign_dump, "wb");
+        if (!df) fprintf(stderr, "  remesh_dc: cannot write --sign-dump %s\n", sign_dump);
+        else {
+            int64_t n = 0;
+            for (int64_t i = 0; i < Nv; ++i)
+                if (dump[5*i+4] >= 0.0f) { fwrite(&dump[5*i], 4, 5, df); ++n; }
+            fclose(df);
+            printf("  remesh_dc: --sign-dump wrote %lld x (x,y,z,udf,F) -> %s\n", (long long)n, sign_dump);
+        }
+    }
     auto fval = [&](int x, int y, int z) -> float {
         auto it = vmap.find(key3(x, y, z));
         return it == vmap.end() ? 1e9f : fvert[it->second];
@@ -370,6 +519,13 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
     std::vector<int32_t> qfaces;
     qfaces.reserve((size_t)Na * 6);
     std::vector<uint8_t> used((size_t)Na, 0);
+    // Every crossing whose four surrounding cells are not all active loses its
+    // quad and leaves a boundary edge. In Unsigned mode this is rare, because
+    // the active predicate tracks the UDF term's zero set exactly. In Interior
+    // mode the parity term can also cross, outside the band, over a hole wider
+    // than 2*eps -- and those cells were never marked active. Counting the drops
+    // says directly whether that is where the open edges come from (R3).
+    int64_t dropped_quads = 0, total_quads = 0;
     for (int64_t i = 0; i < Na; ++i) {
         const int vx = acoord[3*i], vy = acoord[3*i+1], vz = acoord[3*i+2];
         for (int axis = 0; axis < 3; ++axis) {
@@ -382,7 +538,8 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                 if (it == vox.end()) ok = false;
                 else q[k] = it->second;
             }
-            if (!ok) continue;
+            ++total_quads;
+            if (!ok) { ++dropped_quads; continue; }
             static const int S1N[6] = {0, 1, 2, 0, 2, 3};
             static const int S1P[6] = {0, 2, 1, 0, 3, 2};
             const int* sp = dir > 0 ? S1P : S1N;
@@ -434,9 +591,24 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                    project_back, (long long)missed.load(), (long long)NV);
     }
 
-    printf("  remesh_dc: %lld active voxels -> V=%d F=%d (%s=%.4g, project_back=%.2f)\n",
-           (long long)Na, out.V(), out.F(), signed_field ? "SIGNED lvl" : "eps",
+    const char* mname = mode == RemeshMode::Interior ? "INTERIOR"
+                      : (mode == RemeshMode::Signed5 ? "SIGNED5" : "UNSIGNED");
+    printf("  remesh_dc: %lld active voxels -> V=%d F=%d (%s %s=%.4g, project_back=%.2f)\n",
+           (long long)Na, out.V(), out.F(), mname, signed_field ? "lvl" : "eps",
            lvl, project_back);
+    if (dropped_quads)
+        printf("  remesh_dc: %lld/%lld crossing quads dropped (%.3f%%) -- corners outside the "
+               "active set; each leaves up to 4 boundary edges\n",
+               (long long)dropped_quads, (long long)total_quads,
+               total_quads ? 100.0 * (double)dropped_quads / (double)total_quads : 0.0);
+    if (mode == RemeshMode::Interior)
+        printf("  remesh_dc: parity at %lld/%lld grid vertices (%.1f%%), %lld rays "
+               "(%.1f/vertex, max %d), kappa=%.4g\n",
+               (long long)n_parity.load(), (long long)Nv,
+               Nv ? 100.0 * (double)n_parity.load() / (double)Nv : 0.0,
+               (long long)n_rays.load(),
+               n_parity.load() ? (double)n_rays.load() / (double)n_parity.load() : 0.0,
+               std::max(8, sign_rays), kappa);
     fflush(stdout);
     return out;
 }

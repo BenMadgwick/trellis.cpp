@@ -38,7 +38,8 @@ void print_usage(const char* argv0, bool server) {
         "      --box-uv            voxel-native box projection (faster)\n"
         "      --faces N           QEM face budget (default: 300K @1024 / 150K @512)\n"
         "      --normal-map        bake a tangent-space normal map from the high-poly\n"
-        "                          (requires --strip-interior)\n"
+        "                          (needs a single-cover source: any --remesh-mode but\n"
+        "                          'unsigned', or 'unsigned' plus --strip-interior)\n"
         "      --normal-search K   normal-bake search bound, in local edge lengths (default 2)\n"
         "      --normal-cap-shells K  cap the normal-bake search at K offset-shell\n"
         "                          thicknesses (default 4, 0 = uncapped) -- stops the\n"
@@ -46,9 +47,26 @@ void print_usage(const char* argv0, bool server) {
         "      --normal-min-dot K  abandon the normal bake below this winding consensus\n"
         "                          (default 0.85, 0 disables) -- catches an asset whose\n"
         "                          buried sheets the strip failed to remove\n"
+        "      --remesh-mode M     which field the remesh contours: auto (default),\n"
+        "                          interior, signed5, unsigned. 'interior' unions the\n"
+        "                          eps band with the ray-parity interior, so the buried\n"
+        "                          wall is never built and the budget is not split; the\n"
+        "                          outer surface is unchanged. 'auto' adds a fallback to\n"
+        "                          unsigned+strip if the output audit says it failed.\n"
+        "      --sign-rays N       max parity directions per grid vertex (default 64; 8\n"
+        "                          cube diagonals are cast first and decide it when they\n"
+        "                          agree, which is nearly everywhere)\n"
+        "      --no-cull           keep components no ray can escape from (default: drop\n"
+        "                          them -- a two-walled decode's inner bag, parity bubbles)\n"
+        "      --fill-hipoly P     fan-fill high-poly boundary loops up to perimeter P\n"
+        "                          (default 0.25, 0 = off) so QEM and the normal bake\n"
+        "                          never see a hole\n"
+        "      --remesh-project X  lerp each dual vertex X of the way onto the input\n"
+        "                          surface (default 0; 0.9 is the reference's own value)\n"
         "      --strip-interior    drop the buried sheets of the narrow-band shell before\n"
         "                          simplifying, so the budget is spent on the visible\n"
-        "                          surface (no-op when nothing is buried)\n"
+        "                          surface (no-op when nothing is buried). Only needed on\n"
+        "                          --remesh-mode unsigned; the others have no buried sheet\n"
         "      --band N            narrow-band DC remesh band width (default: auto —\n"
         "                          res/512, i.e. 1 @512 / 2 @1024, which suppresses the\n"
         "                          res-1024 outer-skin speckle; N forces that width)\n"
@@ -102,6 +120,17 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "--box-uv")               { p.xatlas = false; }
         else if (a == "--faces")                { const char* v = need(a.c_str()); if (!v) return false; p.faces = atoi(v); }
         else if (a == "--strip-interior")       { p.strip_interior = true; }
+        else if (a == "--remesh-mode")          { const char* v = need(a.c_str()); if (!v) return false;
+                                                  const std::string m = v;
+                                                  if (m != "auto" && m != "interior" && m != "signed5" && m != "unsigned") {
+                                                      fprintf(stderr, "--remesh-mode: expected auto|interior|signed5|unsigned, got '%s'\n", v);
+                                                      return false;
+                                                  }
+                                                  p.remesh_mode = m; }
+        else if (a == "--sign-rays")            { const char* v = need(a.c_str()); if (!v) return false; p.sign_rays = atoi(v); }
+        else if (a == "--no-cull")              { p.cull = false; }
+        else if (a == "--fill-hipoly")          { const char* v = need(a.c_str()); if (!v) return false; p.fill_hipoly = (float)atof(v); }
+        else if (a == "--remesh-project")       { const char* v = need(a.c_str()); if (!v) return false; p.remesh_project = (float)atof(v); }
         else if (a == "--normal-map")           { p.normal_map = true; }
         else if (a == "--normal-search")        { const char* v = need(a.c_str()); if (!v) return false; p.normal_search = (float)atof(v); }
         else if (a == "--normal-min-dot")       { const char* v = need(a.c_str()); if (!v) return false; p.normal_min_dot = (float)atof(v); }

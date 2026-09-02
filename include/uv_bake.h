@@ -133,6 +133,19 @@ int fill_holes(std::vector<float>& verts, std::vector<int32_t>& faces, float max
 void taubin_smooth(std::vector<float>& verts, const std::vector<int32_t>& faces,
                    int iters = 5, float lambda = 0.5f, float mu = -0.53f);
 
+// Drop faces that repeat a vertex triple, orientation-agnostically (CuMesh
+// remove_duplicate_faces): the first occurrence of each sorted index triple
+// survives. In place; returns the number of faces removed.
+//
+// Run this before building a BVH the PARITY test will use. A coincident pair --
+// the same triangle twice, or a triangle and its reverse -- is two crossings on
+// every ray that meets it, so it contributes nothing to parity and reads as a
+// hole exactly where the surface is solid. The welded decoder mesh carries
+// 430-2,240 such sets per asset, which is enough to speckle the interior.
+// clean_mesh does its own dedupe, but far downstream: it runs on the remeshed
+// output, long after the field has been sampled.
+int drop_duplicate_faces(std::vector<int32_t>& faces);
+
 // In-place cleanup of a welded surface mesh (faces only) so meshopt's guarded quadric collapse
 // reaches the target without the roughening FQMS fallback: drop degenerate/duplicate faces and
 // unify face orientations by BFS over manifold-edge adjacency. The narrow-band DC output is ~11%
