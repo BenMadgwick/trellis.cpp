@@ -115,14 +115,19 @@ bool write_vox_preview(const std::vector<std::array<int,3>>& coords, int grid,
     const float half = extent * 0.72f;
     const float scale = (tile * 0.5f) / half;
 
-    static const View views[4] = {
-        { "front", 0.0f,   0.0f },
-        { "3/4",  35.0f,  20.0f },
-        { "side", 90.0f,   0.0f },
-        { "top",   0.0f,  89.0f },
+    // A full turntable at 45 deg intervals, every view pitched 20 deg down so the
+    // top face reads as well as the sides. A straight-on view (pitch 0) shows a
+    // silhouette and nothing of the upper surface, which is where a wrong
+    // generation usually gives itself away.
+    static const View views[8] = {
+        { "000", 0.0f, 20.0f }, { "045",  45.0f, 20.0f },
+        { "090", 90.0f, 20.0f }, { "135", 135.0f, 20.0f },
+        { "180", 180.0f, 20.0f }, { "225", 225.0f, 20.0f },
+        { "270", 270.0f, 20.0f }, { "315", 315.0f, 20.0f },
     };
+    const int NV = 8, COLS = 4;
 
-    const int W = tile*2, H = tile*2;
+    const int W = tile*COLS, H = tile*(NV/COLS);
     std::vector<uint8_t> out((size_t)W*H*3, 24);
 
     // Fixed key light, slightly off-axis so the three visible faces of a cube
@@ -130,7 +135,7 @@ bool write_vox_preview(const std::vector<std::array<int,3>>& coords, int grid,
     Vec3 L = { 0.40f, 0.78f, 0.48f };
     { const float l = std::sqrt(dot(L,L)); L.x/=l; L.y/=l; L.z/=l; }
 
-    for (int vi = 0; vi < 4; ++vi) {
+    for (int vi = 0; vi < NV; ++vi) {
         const float yr = views[vi].yaw_deg   * 3.14159265f / 180.f;
         const float pr = views[vi].pitch_deg * 3.14159265f / 180.f;
         const float cy = std::cos(yr), sy = std::sin(yr);
@@ -192,20 +197,23 @@ bool write_vox_preview(const std::vector<std::array<int,3>>& coords, int grid,
             }
         }
 
-        const int ox = (vi % 2) * tile, oy = (vi / 2) * tile;
+        const int ox = (vi % COLS) * tile, oy = (vi / COLS) * tile;
         for (int y = 0; y < tile; ++y)
             std::memcpy(&out[(((size_t)(oy+y))*W + ox)*3], &r.rgb[(size_t)y*tile*3], (size_t)tile*3);
     }
 
-    // Hairline separators between the quadrants.
-    for (int y = 0; y < H; ++y) { const size_t i = ((size_t)y*W + tile)*3; out[i]=out[i+1]=out[i+2]=64; }
-    for (int x = 0; x < W; ++x) { const size_t i = ((size_t)tile*W + x)*3; out[i]=out[i+1]=out[i+2]=64; }
+    // Hairline separators between the tiles.
+    for (int c = 1; c < COLS; ++c)
+        for (int y = 0; y < H; ++y) { const size_t i = ((size_t)y*W + (size_t)c*tile)*3; out[i]=out[i+1]=out[i+2]=64; }
+    for (int r = 1; r < NV/COLS; ++r)
+        for (int x = 0; x < W; ++x) { const size_t i = ((size_t)r*tile*W + x)*3; out[i]=out[i+1]=out[i+2]=64; }
 
     if (!stbi_write_png(path.c_str(), W, H, 3, out.data(), W*3)) {
         fprintf(stderr, "      [vox] cannot write %s\n", path.c_str());
         return false;
     }
-    printf("      [vox] preview -> %s (%dx%d, front / three-quarter / side / top)\n", path.c_str(), W, H);
+    printf("      [vox] preview -> %s (%dx%d, %d-view turntable at %d deg, pitched %.0f deg down)\n",
+           path.c_str(), W, H, NV, 360 / NV, views[0].pitch_deg);
     fflush(stdout);
     return true;
 }
