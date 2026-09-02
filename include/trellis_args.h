@@ -54,6 +54,7 @@ struct TrellisParams {
     //   "unsigned" the reference double cover; needs --strip-interior
     std::string remesh_mode = "auto";
     int   sign_rays = 64;       // max parity directions per grid vertex (8 cast first)
+    int   parity_coarse = 2;    // coarse-to-fine stride for the parity pass (1 = off)
     bool  cull = true;          // drop components no ray can escape from
     float fill_hipoly = 0.25f;  // fan-fill perimeter ceiling on the high-poly (0 = off)
     float remesh_project = 0.0f;// lerp dual verts onto the input surface (see remesh_dc.h)

@@ -154,6 +154,7 @@ int main(int argc, char** argv) {
     trellis::RemeshMode rmode = trellis::RemeshMode::Interior;
     bool mode_auto = true;
     int sign_rays = 64;
+    int parity_coarse = 2;
     const char* sign_dump = nullptr;
     bool do_cull = true;
     // Perimeter ceiling for the fan-fill on the HIGH-POLY. Holes wider than the
@@ -220,6 +221,7 @@ int main(int argc, char** argv) {
             else { fprintf(stderr, "--remesh-mode: expected unsigned|signed5|interior|auto, got '%s'\n", m.c_str()); return 1; }
         }
         else if (a == "--sign-rays" && i+1 < argc) sign_rays = atoi(argv[++i]);
+        else if (a == "--parity-coarse" && i+1 < argc) parity_coarse = atoi(argv[++i]);
         else if (a == "--sign-dump" && i+1 < argc) sign_dump = argv[++i];
         else if (a == "--no-cull") do_cull = false;
         else if (a == "--fill-hipoly" && i+1 < argc) fill_hipoly = (float)atof(argv[++i]);
@@ -351,7 +353,7 @@ int main(int argc, char** argv) {
         auto build = [&](trellis::RemeshMode m) -> size_t {
             rm = trellis::remesh_narrow_band_dc(verts.data(), (int64_t)verts.size()/3,
                                                 faces.data(), (int64_t)faces.size()/3, bvh, rres, band,
-                                                remesh_project, m, sign_rays, sign_dump);
+                                                remesh_project, m, sign_rays, sign_dump, parity_coarse);
             printf("  [remesh %.1fs]\n", now()-t); t = now();
             audit("remesh", rm.faces);
             if (rm.F() == 0) return 0;

@@ -75,10 +75,16 @@ enum class RemeshMode { Unsigned, Signed5, Interior };
 // diagonals are cast first and decide it outright when unanimous). `sign_dump`,
 // when set, writes float32 x,y,z,udf,F per evaluated band vertex for the R1
 // histogram; nullptr disables it.
+//
+// `coarse` is the coarse-to-fine stride for the parity pass: F is evaluated on
+// every `coarse`-th grid vertex first, and a fine vertex inherits for free when
+// all eight surrounding coarse samples agree. F is 0 or 1 across almost the
+// whole volume, so most of them do. 1 disables it (evaluate every vertex).
 Mesh remesh_narrow_band_dc(const float* verts, int64_t V, const int32_t* faces, int64_t F,
                            const TriBvh& bvh, int res, int band = 1,
                            float project_back = 0.0f,
                            RemeshMode mode = RemeshMode::Unsigned,
-                           int sign_rays = 64, const char* sign_dump = nullptr);
+                           int sign_rays = 64, const char* sign_dump = nullptr,
+                           int coarse = 2);
 
 }  // namespace trellis

@@ -146,6 +146,7 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
                                                   }
                                                   p.remesh_mode = m; }
         else if (a == "--sign-rays")            { const char* v = need(a.c_str()); if (!v) return false; p.sign_rays = atoi(v); }
+        else if (a == "--parity-coarse")        { const char* v = need(a.c_str()); if (!v) return false; p.parity_coarse = atoi(v); }
         else if (a == "--no-cull")              { p.cull = false; }
         else if (a == "--fill-hipoly")          { const char* v = need(a.c_str()); if (!v) return false; p.fill_hipoly = (float)atof(v); }
         else if (a == "--remesh-project")       { const char* v = need(a.c_str()); if (!v) return false; p.remesh_project = (float)atof(v); }

@@ -531,7 +531,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(),
                                                 mesh.faces.data(), mesh.F(),
                                                 bvh, so.res, remesh_band,
-                                                cfg.remesh_project, m, cfg.sign_rays);
+                                                cfg.remesh_project, m, cfg.sign_rays, nullptr, cfg.parity_coarse);
             if (rm.F() == 0) return 1e9;
             trellis::clean_mesh(rm.V(), rm.faces);
             int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
