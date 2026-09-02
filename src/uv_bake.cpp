@@ -26,6 +26,21 @@
 namespace trellis {
 
 namespace {
+
+// Coarse-grained work splitter for the mesh passes below. `min_n` is the point
+// under which threading costs more than it saves.
+void parallel_for(int64_t n, const std::function<void(int64_t, int64_t)>& fn, int64_t min_n = 4096) {
+    const int nt = std::max(1u, std::thread::hardware_concurrency());
+    if (n < min_n || nt == 1) { fn(0, n); return; }
+    std::vector<std::thread> ts;
+    const int64_t chunk = (n + nt - 1) / nt;
+    for (int i = 0; i < nt; ++i) {
+        const int64_t b = i * chunk, e = std::min(n, b + chunk);
+        if (b >= e) break;
+        ts.emplace_back(fn, b, e);
+    }
+    for (auto& th : ts) th.join();
+}
 // Trilinear sampler over the sparse voxel PBR field. Missing corner voxels
 // drop out of the weighted sum (renormalized); a texel with no populated
 // corner stays unwritten and is filled by seam dilation, matching the
@@ -872,22 +887,47 @@ void taubin_smooth(std::vector<float>& verts, const std::vector<int32_t>& faces,
 
 int fill_small_holes(std::vector<int32_t>& faces, int max_loop) {
     const size_t F = faces.size() / 3;
-    auto ekey = [](int a, int b){ return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b; };
-    std::unordered_map<uint64_t, int> dir;
-    dir.reserve(F * 3 * 2);
-    for (size_t f = 0; f < F; ++f)
-        for (int j = 0; j < 3; ++j)
-            dir[ekey(faces[3*f+j], faces[3*f+(j+1)%3])]++;
     // Boundary edges traversed opposite to face winding so fan fills keep
     // orientation consistent with their neighbors. Chains pass only through
     // unambiguous boundary vertices (out- and in-degree exactly 1): at
     // non-manifold junctions a single-successor map silently cross-links
     // fragments of different holes into bogus mesh-spanning "loops".
     std::unordered_map<int, int> nxt, outd, ind;
-    for (const auto& [k, cnt] : dir) {
-        const int a = (int)(k >> 32), b = (int)(uint32_t)k;
-        if (cnt == 1 && dir.find(ekey(b, a)) == dir.end()) {
-            nxt[b] = a; outd[b]++; ind[a]++;
+    {
+        // Sort, don't hash. This used to build an unordered_map over every
+        // directed edge -- 44 M insertions on the bear's 14.7 M faces, and 49.8 s
+        // of the mesh stage. Sorting the same keys is a fraction of that and
+        // parallelises, where a hash map with this many distinct keys is all
+        // cache misses.
+        //
+        // One key per directed edge: the UNDIRECTED pair in the high bits so
+        // equal edges sort together, and a direction bit in bit 0. An undirected
+        // edge used exactly once is a boundary, and the bit says which way that
+        // single use ran -- which is what the old "count is 1 and the reverse is
+        // absent" test was really asking.
+        std::vector<uint64_t> ek((size_t)F * 3);
+        parallel_for((int64_t)F, [&](int64_t b, int64_t e) {
+            for (int64_t f = b; f < e; ++f)
+                for (int j = 0; j < 3; ++j) {
+                    const int32_t u = faces[3*f+j], v = faces[3*f+(j+1)%3];
+                    const uint64_t mn = (uint64_t)(uint32_t)std::min(u, v);
+                    const uint64_t mx = (uint64_t)(uint32_t)std::max(u, v);
+                    ek[(size_t)f*3 + j] = (((mn << 31) | mx) << 1) | (uint64_t)(u > v);
+                }
+        });
+        std::sort(ek.begin(), ek.end());
+        for (size_t i = 0; i < ek.size(); ) {
+            const uint64_t canon = ek[i] >> 1;
+            size_t j = i + 1;
+            while (j < ek.size() && (ek[j] >> 1) == canon) ++j;
+            if (j - i == 1) {
+                const int mn = (int)(uint32_t)(canon >> 31);
+                const int mx = (int)(uint32_t)(canon & 0x7FFFFFFFull);
+                const int a = (ek[i] & 1) ? mx : mn;      // the directed use, u -> v
+                const int b = (ek[i] & 1) ? mn : mx;
+                nxt[b] = a; outd[b]++; ind[a]++;
+            }
+            i = j;
         }
     }
     std::unordered_map<int, bool> used;
@@ -920,6 +960,7 @@ int fill_small_holes(std::vector<int32_t>& faces, int max_loop) {
     // restricted to unambiguous degree-2 vertices.
     {
         const size_t F2 = faces.size() / 3;
+        auto ekey = [](int a, int b){ return ((uint64_t)(uint32_t)a << 32) | (uint32_t)b; };
         std::unordered_map<uint64_t, int> und;
         und.reserve(F2 * 3 * 2);
         for (size_t f = 0; f < F2; ++f)
