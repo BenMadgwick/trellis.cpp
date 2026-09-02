@@ -48,16 +48,30 @@ public:
 
     bool empty() const { return nodes_.empty(); }
 
-private:
+    // Flat, POD, contiguous -- and therefore directly uploadable to a GPU with
+    // no pointer fix-up. The parity pass is the remesh's dominant cost and is
+    // embarrassingly parallel (every vertex independent, every ray independent),
+    // so parity_gpu.cu traverses this same layout on the device. Exposed rather
+    // than duplicated so the CPU and GPU paths cannot drift apart.
     struct Node {
         float bmin[3], bmax[3];
         int32_t left;    // internal: index of left child (right = left+1); leaf: first prim index
         int32_t count;   // 0 for internal nodes; >0 = leaf primitive count
     };
+    const Node*    nodes()  const { return nodes_.data(); }
+    int64_t        n_nodes() const { return (int64_t)nodes_.size(); }
+    const int32_t* prims()  const { return prim_.data(); }
+    int64_t        n_prims() const { return (int64_t)prim_.size(); }
+    const float*   verts()  const { return verts_; }
+    const int32_t* faces()  const { return faces_; }
+    int64_t        n_verts() const { return V_; }
+
+private:
     std::vector<Node> nodes_;
     std::vector<int32_t> prim_;
     const float* verts_ = nullptr;
     const int32_t* faces_ = nullptr;
+    int64_t V_ = 0;
 };
 
 }  // namespace trellis

@@ -149,6 +149,11 @@ if(TARGET ggml-cuda)
   target_sources(trellis_core PRIVATE src/deform_conv.cu)
   # Self-contained CUDA QEM decimation (mirrors the CPU port; uses cub for scan/sort/RLE).
   target_sources(trellis_core PRIVATE src/decimate_qem.cu)
+  # GPU parity for the Interior remesh: the pass that dominates that stage, and
+  # the one workload here that a GPU is literally designed for (BVH ray
+  # traversal). The CPU path stays and is used whenever this cannot run.
+  target_sources(trellis_core PRIVATE src/parity_gpu.cu)
+  target_compile_definitions(trellis_core PUBLIC TRELLIS_HAVE_GPU_PARITY)
   if(MSVC)
     # CUDA 13.3 CCCL requires MSVC's conforming preprocessor for host compilation.
     target_compile_options(trellis_core PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>")

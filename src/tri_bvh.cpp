@@ -58,10 +58,10 @@ inline float box_dist2(const float* p, const float* bmin, const float* bmax) {
 }  // namespace
 
 TriBvh TriBvh::build(const float* verts, int64_t V, const int32_t* faces, int64_t F) {
-    (void)V;
     TriBvh t;
     t.verts_ = verts;
     t.faces_ = faces;
+    t.V_ = V;
     if (F == 0) return t;
     t.prim_.resize((size_t)F);
     std::vector<float> cent((size_t)F * 3);

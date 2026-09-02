@@ -21,6 +21,7 @@ bool parity_fraction_gpu(const TriBvh& bvh, const std::vector<float>& pts,
                          const std::vector<uint64_t>& seeds,
                          const std::vector<float>& extra_dirs, float reach,
                          std::vector<float>& F);
+void parity_gpu_release();
 #endif
 
 namespace {
@@ -300,7 +301,7 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
     if (mode == RemeshMode::Interior && sign_rays > 8) fib_sphere(sign_rays - 8, extra_dirs);
     std::atomic<int64_t> n_parity{0};
     std::atomic<int64_t> n_rays{0};
-    int64_t n_inherited = 0;
+    int64_t n_inherited = 0, n_gpu_verts = 0;
 
     // Candidate cells: conservative dilation of every triangle's AABB by the
     // band-plus-crossing radius, marked in a res^3 bitset.
@@ -508,33 +509,32 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
             return (vcoord[3*i] % cs) == 0 && (vcoord[3*i+1] % cs) == 0 && (vcoord[3*i+2] % cs) == 0;
         };
 
-        // Gather the lattice vertices once, so the GPU sees one big batch and
-        // the CPU fallback walks the same list.
-        std::vector<int64_t> todo;
-        for (int64_t i = 0; i < Nv; ++i)
-            if (want[i] && (cs == 1 || on_lattice(i))) todo.push_back(i);
-
-        bool on_gpu = false;
+        // One batch runner for both passes: the GPU wants a large contiguous
+        // batch, and the CPU fallback walks the identical list, so neither path
+        // can drift from the other.
+        std::atomic<int64_t> n_gpu{0};
+        auto run_batch = [&](const std::vector<int64_t>& todo) {
+            if (todo.empty()) return;
 #ifdef TRELLIS_HAVE_GPU_PARITY
-        if (!todo.empty()) {
-            std::vector<float> pts((size_t)todo.size() * 3);
-            std::vector<uint64_t> sds((size_t)todo.size());
-            for (size_t t = 0; t < todo.size(); ++t) {
-                const int64_t i = todo[t];
-                pts[3*t]   = ((float)vcoord[3*i]   / res - 0.5f) * scale;
-                pts[3*t+1] = ((float)vcoord[3*i+1] / res - 0.5f) * scale;
-                pts[3*t+2] = ((float)vcoord[3*i+2] / res - 0.5f) * scale;
-                sds[t] = key3(vcoord[3*i], vcoord[3*i+1], vcoord[3*i+2]);
+            {
+                std::vector<float> pts((size_t)todo.size() * 3);
+                std::vector<uint64_t> sds((size_t)todo.size());
+                for (size_t t = 0; t < todo.size(); ++t) {
+                    const int64_t i = todo[t];
+                    pts[3*t]   = ((float)vcoord[3*i]   / res - 0.5f) * scale;
+                    pts[3*t+1] = ((float)vcoord[3*i+1] / res - 0.5f) * scale;
+                    pts[3*t+2] = ((float)vcoord[3*i+2] / res - 0.5f) * scale;
+                    sds[t] = key3(vcoord[3*i], vcoord[3*i+1], vcoord[3*i+2]);
+                }
+                std::vector<float> gF;
+                if (parity_fraction_gpu(bvh, pts, sds, extra_dirs, reach, gF) && gF.size() == todo.size()) {
+                    for (size_t t = 0; t < todo.size(); ++t) Fv[todo[t]] = gF[t];
+                    n_coarse.fetch_add((int64_t)todo.size(), std::memory_order_relaxed);
+                    n_gpu.fetch_add((int64_t)todo.size(), std::memory_order_relaxed);
+                    return;
+                }
             }
-            std::vector<float> gF;
-            if (parity_fraction_gpu(bvh, pts, sds, extra_dirs, reach, gF) && gF.size() == todo.size()) {
-                for (size_t t = 0; t < todo.size(); ++t) Fv[todo[t]] = gF[t];
-                n_coarse.fetch_add((int64_t)todo.size(), std::memory_order_relaxed);
-                on_gpu = true;
-            }
-        }
 #endif
-        if (!on_gpu) {
             parallel_for((int64_t)todo.size(), [&](int64_t b, int64_t e) {
                 int64_t local_rays = 0, local_n = 0;
                 for (int64_t t = b; t < e; ++t) {
@@ -544,11 +544,21 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                 if (local_n) { n_coarse.fetch_add(local_n, std::memory_order_relaxed);
                                n_rays.fetch_add(local_rays, std::memory_order_relaxed); }
             });
-        }
+        };
+
+        std::vector<int64_t> todo;
+        for (int64_t i = 0; i < Nv; ++i)
+            if (want[i] && (cs == 1 || on_lattice(i))) todo.push_back(i);
+        run_batch(todo);
 
         if (cs > 1) {
+            // Decide inherit-or-evaluate for every fine vertex FIRST, then send
+            // the survivors through the same batch runner. Deciding is cheap
+            // (eight map lookups); evaluating is not, and batching it is what
+            // lets the GPU see one large launch instead of a trickle.
+            std::vector<uint8_t> need((size_t)Nv, 0);
             parallel_for(Nv, [&](int64_t b, int64_t e) {
-                int64_t local_rays = 0, local_n = 0, local_inh = 0;
+                int64_t local_inh = 0;
                 for (int64_t i = b; i < e; ++i) {
                     if (!want[i] || Fv[i] >= 0.0f) continue;
                     // The eight lattice corners of the coarse cell holding this vertex.
@@ -578,16 +588,20 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                         ++local_inh;
                         continue;
                     }
-                    Fv[i] = eval(i, &local_rays);
-                    ++local_n;
+                    need[i] = 1;
                 }
-                if (local_n || local_inh) {
-                    n_coarse.fetch_add(local_n, std::memory_order_relaxed);
-                    n_inherit.fetch_add(local_inh, std::memory_order_relaxed);
-                    n_rays.fetch_add(local_rays, std::memory_order_relaxed);
-                }
+                if (local_inh) n_inherit.fetch_add(local_inh, std::memory_order_relaxed);
             });
+            std::vector<int64_t> todo2;
+            for (int64_t i = 0; i < Nv; ++i) if (need[i]) todo2.push_back(i);
+            run_batch(todo2);
         }
+        n_gpu_verts = n_gpu.load();
+#ifdef TRELLIS_HAVE_GPU_PARITY
+        // The dual-contouring and cleanup below need no BVH, and the caller has
+        // texture stages after that; give the VRAM back now.
+        if (n_gpu_verts) parity_gpu_release();
+#endif
 
         n_parity.store(n_coarse.load() + n_inherit.load());
         n_inherited = n_inherit.load();
@@ -764,9 +778,11 @@ Mesh remesh_narrow_band_dc(const float* iverts, int64_t iV, const int32_t* iface
                (long long)np, (long long)Nv, Nv ? 100.0 * (double)np / (double)Nv : 0.0,
                (long long)ev, (long long)ni, np ? 100.0 * (double)ni / (double)np : 0.0,
                std::max(1, coarse));
-        printf("  remesh_dc: %lld rays (%.1f per evaluated vertex, max %d), kappa=%.4g\n",
-               (long long)n_rays.load(),
-               ev ? (double)n_rays.load() / (double)ev : 0.0,
+        const int64_t cpu_ev = ev - n_gpu_verts;
+        printf("  remesh_dc: %lld evaluated on the GPU, %lld on the CPU (%lld rays, %.1f per CPU "
+               "vertex, max %d), kappa=%.4g\n",
+               (long long)n_gpu_verts, (long long)cpu_ev, (long long)n_rays.load(),
+               cpu_ev ? (double)n_rays.load() / (double)cpu_ev : 0.0,
                std::max(8, sign_rays), kappa);
     }
     fflush(stdout);
