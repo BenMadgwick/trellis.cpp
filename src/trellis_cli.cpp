@@ -435,6 +435,24 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             }
             printf("      PBR voxels=%d @res%d\n", Mv, pbr_res);
         }
+
+        // ---- the second offramp -------------------------------------------
+        // The last point where the asset is fully described -- shape AND colour
+        // -- and the mesh post-processing below has not started. That stage is
+        // the expensive one for a dense subject (measured: over an hour on a
+        // 34.6 M-face pallet), so an asset that is clearly wrong is worth
+        // stopping here even though the flows have already been paid for.
+        //
+        // Unlike --vox-only this cannot be reached cheaply; it exists to skip
+        // what comes after, not what came before.
+        if (!cfg.tex_render.empty() && !colors.empty())
+            trellis::write_vox_preview(*pbr_coords, pbr_res, cfg.tex_render, 320, &colors);
+        if (cfg.tex_only) {
+            if (cfg.tex_render.empty())
+                printf("      (--tex-only without --tex-render produced no preview)\n");
+            printf("[tex-only] done (%.1fs) -- stopped before mesh post-processing\n", now() - t0);
+            return 0;
+        }
         // `colors` is per-VOXEL but consumed per-VERTEX (weld, vertex-color GLB, PLY),
         // relying on dual_grid_to_mesh's vertex==voxel correspondence. fill_holes adds
         // cap vertices beyond Mv -- pad them (neutral grey; the caps are sub-voxel and

@@ -94,6 +94,12 @@ struct TrellisParams {
     std::string vox_render;     // write a 4-view voxel preview PNG here
     std::string save_vox;       // write the resume cache here
     std::string load_vox;       // resume from this cache, skipping stages [1]-[3]
+    // Second offramp, after the texture decode: shape AND colour are known, and
+    // the mesh post-processing (the expensive stage on a dense subject) has not
+    // started. Cannot be reached cheaply -- it skips what comes after, not what
+    // came before.
+    bool tex_only = false;      // stop after the PBR decode, before post-processing
+    std::string tex_render;     // write a coloured 8-view voxel preview here
 
     bool voxply = false;        // dump out/myvox.ply              (debug)
     bool dump_slat = false;     // dump /tmp/hr_slat.bin           (debug)

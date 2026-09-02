@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
 #include <unordered_set>
 
 // Declarations only; STB_IMAGE_WRITE_IMPLEMENTATION lives in mesh_glb.cpp.
@@ -23,6 +24,13 @@ inline float dot(const Vec3& a, const Vec3& b) { return a.x*b.x + a.y*b.y + a.z*
 inline uint32_t vkey(int x, int y, int z) {
     return ((uint32_t)(x & 1023) << 20) | ((uint32_t)(y & 1023) << 10) | (uint32_t)(z & 1023);
 }
+
+// TRELLIS space is Z-up; glTF is Y-up, and mesh_glb.cpp rotates (x,y,z)->(x,z,-y)
+// on export. The preview applies the SAME rotation, so it shows the asset the way
+// the finished GLB will be seen. Without it the turntable yaws about a horizontal
+// axis and the subject cartwheels -- a pallet's feet sweep round the outside of
+// the frame instead of staying on the floor.
+inline Vec3 to_gltf(const Vec3& p) { return { p.x, p.z, -p.y }; }
 
 // Yaw about Y then pitch about X. Right-handed, -Z into the screen.
 struct View {
@@ -88,13 +96,52 @@ struct Raster {
 
 }  // namespace
 
-bool write_vox_preview(const std::vector<std::array<int,3>>& coords, int grid,
-                       const std::string& path, int tile) {
-    if (coords.empty() || grid <= 0 || tile < 32) return false;
+bool write_vox_preview(const std::vector<std::array<int,3>>& coords_in, int grid_in,
+                       const std::string& path, int tile,
+                       const std::vector<float>* rgb_in, int max_grid) {
+    if (coords_in.empty() || grid_in <= 0 || tile < 32) return false;
+
+    // The textured field arrives at res 512 or 1024 -- millions of voxels, far
+    // more than 320 px tiles can show. Bin it down to a lattice the preview can
+    // actually resolve, averaging colour over each bin. This is what keeps the
+    // coloured preview a few seconds rather than a few minutes.
+    std::vector<std::array<int,3>> binned;
+    std::vector<float> binned_rgb;
+    const std::vector<std::array<int,3>>* coords = &coords_in;
+    const std::vector<float>* rgb = rgb_in;
+    int grid = grid_in;
+    if (grid_in > max_grid) {
+        const int bf = (grid_in + max_grid - 1) / max_grid;      // integer bin factor
+        grid = (grid_in + bf - 1) / bf;
+        std::unordered_map<uint32_t, int> at;                    // bin key -> index
+        at.reserve(coords_in.size());
+        std::vector<int> cnt;
+        for (size_t i = 0; i < coords_in.size(); ++i) {
+            const int bx = coords_in[i][0]/bf, by = coords_in[i][1]/bf, bz = coords_in[i][2]/bf;
+            const uint32_t k = vkey(bx, by, bz);
+            auto it = at.find(k);
+            if (it == at.end()) {
+                it = at.emplace(k, (int)binned.size()).first;
+                binned.push_back({bx, by, bz});
+                cnt.push_back(0);
+                if (rgb_in) binned_rgb.insert(binned_rgb.end(), {0.f, 0.f, 0.f});
+            }
+            ++cnt[it->second];
+            if (rgb_in && 3*i + 2 < rgb_in->size())
+                for (int k2 = 0; k2 < 3; ++k2) binned_rgb[3*(size_t)it->second + k2] += (*rgb_in)[3*i + k2];
+        }
+        if (rgb_in)
+            for (size_t b = 0; b < binned.size(); ++b)
+                for (int k2 = 0; k2 < 3; ++k2) binned_rgb[3*b + k2] /= (float)std::max(1, cnt[b]);
+        coords = &binned;
+        rgb = rgb_in ? &binned_rgb : nullptr;
+        printf("      [vox] binned %zu voxels @grid %d -> %zu @grid %d for the preview\n",
+               coords_in.size(), grid_in, binned.size(), grid);
+    }
 
     std::unordered_set<uint32_t> occ;
-    occ.reserve(coords.size() * 2);
-    for (const auto& c : coords) occ.insert(vkey(c[0], c[1], c[2]));
+    occ.reserve(coords->size() * 2);
+    for (const auto& c : *coords) occ.insert(vkey(c[0], c[1], c[2]));
 
     // World placement: voxel i spans [i/grid - 0.5, (i+1)/grid - 0.5], matching
     // the --voxply dump so the preview and that point cloud agree.
@@ -104,7 +151,7 @@ bool write_vox_preview(const std::vector<std::array<int,3>>& coords, int grid,
     // Centre on the OCCUPIED bounding box, and share one scale across all four
     // views so the tiles are directly comparable rather than each self-fitted.
     int lo[3] = {grid, grid, grid}, hi[3] = {-1, -1, -1};
-    for (const auto& c : coords)
+    for (const auto& c : *coords)
         for (int k = 0; k < 3; ++k) { lo[k] = std::min(lo[k], c[k]); hi[k] = std::max(hi[k], c[k]); }
     const Vec3 centre = { ((lo[0]+hi[0])*0.5f + 0.5f)*vs - 0.5f,
                           ((lo[1]+hi[1])*0.5f + 0.5f)*vs - 0.5f,
@@ -144,7 +191,8 @@ bool write_vox_preview(const std::vector<std::array<int,3>>& coords, int grid,
         Raster r;
         r.init(tile, tile, 24);
 
-        for (const auto& c : coords) {
+        for (size_t ci = 0; ci < coords->size(); ++ci) {
+            const std::array<int,3>& c = (*coords)[ci];
             const Vec3 vc = { (c[0]+0.5f)*vs - 0.5f, (c[1]+0.5f)*vs - 0.5f, (c[2]+0.5f)*vs - 0.5f };
             for (int f = 0; f < 6; ++f) {
                 // Skip a face whose neighbour is solid: it can never be seen.
@@ -152,7 +200,7 @@ bool write_vox_preview(const std::vector<std::array<int,3>>& coords, int grid,
                 if (nx >= 0 && ny >= 0 && nz >= 0 && nx < grid && ny < grid && nz < grid &&
                     occ.count(vkey(nx, ny, nz))) continue;
 
-                const Vec3 n = { (float)FACE_N[f][0], (float)FACE_N[f][1], (float)FACE_N[f][2] };
+                const Vec3 n = to_gltf({ (float)FACE_N[f][0], (float)FACE_N[f][1], (float)FACE_N[f][2] });
                 const Vec3 nv = rotate(n, cy, sy, cp, sp);
                 if (nv.z <= 0.0f) continue;                 // back-facing after rotation
 
@@ -177,17 +225,24 @@ bool write_vox_preview(const std::vector<std::array<int,3>>& coords, int grid,
 
                 const float lam = std::max(0.0f, dot(n, L));
                 const float ints = (0.28f + 0.72f * lam) * ao;
+                // Per-voxel albedo when the caller has it (the textured field
+                // after the PBR decode); the neutral blue-grey otherwise (the
+                // structure stage, which has occupancy and no colour at all).
+                float base[3] = { 150.f, 168.f, 196.f };
+                if (rgb && 3*ci + 2 < rgb->size())
+                    for (int k = 0; k < 3; ++k)
+                        base[k] = 255.f * std::min(1.0f, std::max(0.0f, (*rgb)[3*ci + k]));
                 const uint8_t col[3] = {
-                    (uint8_t)std::min(255.f, 150.f * ints + 24.f),
-                    (uint8_t)std::min(255.f, 168.f * ints + 26.f),
-                    (uint8_t)std::min(255.f, 196.f * ints + 30.f) };
+                    (uint8_t)std::min(255.f, base[0] * ints + 16.f),
+                    (uint8_t)std::min(255.f, base[1] * ints + 16.f),
+                    (uint8_t)std::min(255.f, base[2] * ints + 16.f) };
 
                 float scr[4][3];
                 for (int k = 0; k < 4; ++k) {
                     const Vec3 wp = { vc.x + FACE[f][k][0]*hs,
                                       vc.y + FACE[f][k][1]*hs,
                                       vc.z + FACE[f][k][2]*hs };
-                    const Vec3 rp = rotate(wp - centre, cy, sy, cp, sp);
+                    const Vec3 rp = rotate(to_gltf(wp - centre), cy, sy, cp, sp);
                     scr[k][0] = tile*0.5f + rp.x * scale;
                     scr[k][1] = tile*0.5f - rp.y * scale;     // screen y grows downward
                     scr[k][2] = -rp.z;                        // smaller = nearer
