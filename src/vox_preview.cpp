@@ -57,14 +57,36 @@ const int FACE[6][4][3] = {
 };
 const int FACE_N[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
 
+// Preview legibility. The background ramp (see Raster::init) sits mid-grey so
+// neither a black nor a white subject vanishes into it. ALBEDO_LIFT is added to
+// the base colour BEFORE shading, so a near-black albedo still varies with the
+// surface normal instead of collapsing to one flat tone: the shading term is
+// multiplicative, so without a lift no amount of ambient can bring form out of
+// an albedo of 0. Judging "is this the right shape" needs form, not colour
+// fidelity, so a modest lift is the right trade.
+const uint8_t BG_TOP = 128, BG_BOT = 98;
+const float   ALBEDO_LIFT = 45.f;
+
 struct Raster {
     int w = 0, h = 0;
     std::vector<float> depth;
     std::vector<uint8_t> rgb;
-    void init(int W, int H, uint8_t bg) {
+    // A single flat background cannot separate every subject from it: against
+    // the old near-black (24) a dark asset was genuinely illegible, and a black
+    // briefcase's fault was invisible here while obvious in a GLB render. An
+    // offramp the viewer cannot read is worse than none, because it invites a
+    // confident "looks fine". A mid-grey with a slight vertical gradient keeps
+    // a silhouette readable whatever the albedo: a flat asset matching one end
+    // of the ramp still separates from the other.
+    void init(int W, int H, uint8_t bg_top, uint8_t bg_bot) {
         w = W; h = H;
         depth.assign((size_t)W*H, 1e30f);
-        rgb.assign((size_t)W*H*3, bg);
+        rgb.resize((size_t)W*H*3);
+        for (int y = 0; y < H; ++y) {
+            const float t = H > 1 ? (float)y / (float)(H - 1) : 0.f;
+            const uint8_t v = (uint8_t)(bg_top + (bg_bot - bg_top) * t);
+            std::fill(rgb.begin() + (size_t)y*W*3, rgb.begin() + (size_t)(y+1)*W*3, v);
+        }
     }
     void tri(const float p0[3], const float p1[3], const float p2[3], const uint8_t c[3]) {
         const float minxf = std::min({p0[0], p1[0], p2[0]});
@@ -189,7 +211,7 @@ bool write_vox_preview(const std::vector<std::array<int,3>>& coords_in, int grid
         const float cp = std::cos(pr), sp = std::sin(pr);
 
         Raster r;
-        r.init(tile, tile, 24);
+        r.init(tile, tile, BG_TOP, BG_BOT);
 
         for (size_t ci = 0; ci < coords->size(); ++ci) {
             const std::array<int,3>& c = (*coords)[ci];
@@ -233,9 +255,9 @@ bool write_vox_preview(const std::vector<std::array<int,3>>& coords_in, int grid
                     for (int k = 0; k < 3; ++k)
                         base[k] = 255.f * std::min(1.0f, std::max(0.0f, (*rgb)[3*ci + k]));
                 const uint8_t col[3] = {
-                    (uint8_t)std::min(255.f, base[0] * ints + 16.f),
-                    (uint8_t)std::min(255.f, base[1] * ints + 16.f),
-                    (uint8_t)std::min(255.f, base[2] * ints + 16.f) };
+                    (uint8_t)std::min(255.f, (base[0] + ALBEDO_LIFT) * ints + 16.f),
+                    (uint8_t)std::min(255.f, (base[1] + ALBEDO_LIFT) * ints + 16.f),
+                    (uint8_t)std::min(255.f, (base[2] + ALBEDO_LIFT) * ints + 16.f) };
 
                 float scr[4][3];
                 for (int k = 0; k < 4; ++k) {
