@@ -589,15 +589,10 @@ void clean_mesh(int V, std::vector<int32_t>& faces) {
     }
     const int F = (int)(faces.size() / 3);
     if (F == 0) return;
-    // 2. undirected edge -> incident faces
-    std::unordered_map<uint64_t, std::vector<int>> ef;
-    ef.reserve((size_t)F * 3);
     auto ek = [](int a, int b) -> uint64_t {
         return ((uint64_t)(uint32_t)std::min(a, b) << 32) | (uint32_t)std::max(a, b);
     };
-    for (int f = 0; f < F; ++f)
-        for (int j = 0; j < 3; ++j) ef[ek(faces[3*f+j], faces[3*f+(j+1)%3])].push_back(f);
-    // Is it already consistently wound? Two faces sharing an edge agree exactly
+    // 2. Is it already consistently wound? Two faces sharing an edge agree exactly
     // when they traverse it in opposite directions.
     //
     // The BFS below picks an arbitrary orientation per PATCH, from whichever
@@ -607,23 +602,34 @@ void clean_mesh(int V, std::vector<int32_t>& faces) {
     // the jerry can, remesh_dc's Interior output arrives 100.00% consistent and
     // came out of here at 99.98%, with 7,346,417 faces needlessly flipped.
     //
-    // Unifying an already-unified mesh has nothing to gain, so don't.
+    // Unifying an already-unified mesh has nothing to gain, so don't -- and
+    // answer the question by SORTING the edge keys rather than building the
+    // edge->faces map, which is 44 M push_backs into 22 M separately allocated
+    // vectors on the bear. That map is only needed for the BFS, so it is now
+    // built lazily below, on the rare mesh that actually needs unifying.
     {
+        std::vector<uint64_t> ekv((size_t)F * 3);
+        parallel_for(F, [&](int64_t b0, int64_t e0) {
+            for (int64_t f = b0; f < e0; ++f)
+                for (int j = 0; j < 3; ++j) {
+                    const int32_t u = faces[3*f+j], v = faces[3*f+(j+1)%3];
+                    const uint64_t mn = (uint64_t)(uint32_t)std::min(u, v);
+                    const uint64_t mx = (uint64_t)(uint32_t)std::max(u, v);
+                    ekv[(size_t)f*3 + j] = (((mn << 31) | mx) << 1) | (uint64_t)(u > v);
+                }
+        });
+        std::sort(ekv.begin(), ekv.end());
         int64_t n2 = 0, cons = 0;
-        for (int f = 0; f < F; ++f)
-            for (int j = 0; j < 3; ++j) {
-                const int a = faces[3*f+j], b = faces[3*f+(j+1)%3];
-                if (a >= b) continue;                    // count each undirected edge once
-                auto it = ef.find(ek(a, b));
-                if (it == ef.end() || it->second.size() != 2) continue;
+        for (size_t i = 0; i < ekv.size(); ) {
+            const uint64_t canon = ekv[i] >> 1;
+            size_t j = i + 1;
+            while (j < ekv.size() && (ekv[j] >> 1) == canon) ++j;
+            if (j - i == 2) {                                  // manifold edge
                 ++n2;
-                // Consistent iff the OTHER face traverses b->a.
-                const int g = it->second[0] == f ? it->second[1] : it->second[0];
-                bool same = false;
-                for (int k = 0; k < 3; ++k)
-                    if (faces[3*g+k] == a && faces[3*g+(k+1)%3] == b) { same = true; break; }
-                if (!same) ++cons;
+                if ((ekv[i] & 1) != (ekv[i+1] & 1)) ++cons;    // traversed opposite ways
             }
+            i = j;
+        }
         if (n2 && cons >= (int64_t)(0.999 * (double)n2)) {
             printf("    [clean] faces=%d, winding already %.2f%% consistent over %lld edges; "
                    "not unifying\n", F, 100.0 * (double)cons / (double)n2, (long long)n2);
@@ -631,7 +637,14 @@ void clean_mesh(int V, std::vector<int32_t>& faces) {
             return;
         }
     }
-    // 3. BFS flood; flip faces to a consistent winding across manifold (exactly-2-face) edges.
+    // 3. Only now, for a mesh that genuinely needs unifying: undirected edge ->
+    // incident faces, which the BFS below walks.
+    std::unordered_map<uint64_t, std::vector<int>> ef;
+    ef.reserve((size_t)F * 3);
+    for (int f = 0; f < F; ++f)
+        for (int j = 0; j < 3; ++j) ef[ek(faces[3*f+j], faces[3*f+(j+1)%3])].push_back(f);
+
+    // 4. BFS flood; flip faces to a consistent winding across manifold (exactly-2-face) edges.
     // Non-manifold / boundary edges are not crossed, so orientation stays locally consistent.
     std::vector<char> vis(F, 0), flip(F, 0);
     std::vector<int> st;
@@ -767,17 +780,21 @@ int drop_small_components(std::vector<float>& verts, std::vector<int32_t>& faces
     auto find = [&](int x) { while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; } return x; };
     auto uni  = [&](int a, int b) { int ra = find(a), rb = find(b); if (ra != rb) par[ra] = rb; };
     for (size_t f = 0; f < F; ++f) { uni(faces[3*f], faces[3*f+1]); uni(faces[3*f+1], faces[3*f+2]); }
-    std::unordered_map<int,int> fc;
-    for (size_t f = 0; f < F; ++f) fc[find(faces[3*f])]++;
+    // Per-root face counts in a plain array, not a hash map. Roots ARE vertex
+    // indices, so an array indexes directly where the map cost a hash lookup per
+    // face -- 14.7 M of them on the bear. Only roots are ever touched, so the
+    // sparse V-sized array is cheaper than it looks.
+    std::vector<int> fc((size_t)V, 0);
+    for (size_t f = 0; f < F; ++f) ++fc[(size_t)find(faces[3*f])];
     int maxfc = 0;
-    for (auto& kv : fc) maxfc = std::max(maxfc, kv.second);
+    for (int v = 0; v < V; ++v) maxfc = std::max(maxfc, fc[(size_t)v]);
     const int thresh = (int)(frac * maxfc);
     int dropped = 0;
-    for (auto& kv : fc) if (kv.second < thresh) ++dropped;
+    for (int v = 0; v < V; ++v) if (fc[(size_t)v] && fc[(size_t)v] < thresh) ++dropped;
     if (dropped == 0) return 0;
     std::vector<int32_t> kf; kf.reserve(faces.size());
     for (size_t f = 0; f < F; ++f)
-        if (fc[find(faces[3*f])] >= thresh)
+        if (fc[(size_t)find(faces[3*f])] >= thresh)
             for (int k = 0; k < 3; ++k) kf.push_back(faces[3*f + k]);
     std::vector<int> remap((size_t)V, -1);
     std::vector<float> nv; nv.reserve(verts.size());
