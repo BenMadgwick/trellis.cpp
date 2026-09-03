@@ -28,6 +28,13 @@ void print_usage(const char* argv0, bool server) {
         "  -s, --seed N            RNG seed                     (default 42)\n"
         "      --res 512|1024|1536 geometry resolution\n"
         "      --max-tokens N      HR token budget              (default 49152)\n"
+        "      --steps N           sampler steps for every flow (default 12). This is the\n"
+        "                          resolution of one ODE integration, not a progress\n"
+        "                          counter: with the same seed a low-step run is the SAME\n"
+        "                          asset, less converged, so it previews the full run\n"
+        "      --steps-ss N        override, sparse-structure flow\n"
+        "      --steps-shape N     override, shape flow (LR and HR)\n"
+        "      --steps-tex N       override, texture flow\n"
         "      --bg-removal MODE   threshold | birefnet   (default: auto -- a pre-matted\n"
         "                          image keeps its alpha; otherwise BiRefNet when its model\n"
         "                          is present. The plain threshold matte cuts out specular\n"
@@ -131,6 +138,10 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "-s" || a == "--seed")    { const char* v = need(a.c_str()); if (!v) return false; p.seed = (uint32_t)atoi(v); }
         else if (a == "--res")                  { const char* v = need(a.c_str()); if (!v) return false; p.set_res(atoi(v)); }
         else if (a == "--max-tokens")           { const char* v = need(a.c_str()); if (!v) return false; p.max_tokens = atoi(v); }
+        else if (a == "--steps")                { const char* v = need(a.c_str()); if (!v) return false; p.steps = atoi(v); }
+        else if (a == "--steps-ss")             { const char* v = need(a.c_str()); if (!v) return false; p.steps_ss = atoi(v); }
+        else if (a == "--steps-shape")          { const char* v = need(a.c_str()); if (!v) return false; p.steps_shape = atoi(v); }
+        else if (a == "--steps-tex")            { const char* v = need(a.c_str()); if (!v) return false; p.steps_tex = atoi(v); }
         else if (a == "--bg-removal")           { const char* v = need(a.c_str()); if (!v) return false; p.birefnet = (std::strcmp(v, "birefnet") == 0) ? 1 : 0; }
         else if (a == "--birefnet")             { p.birefnet = 1; }
         else if (a == "--no-texture")           { p.texture = false; }

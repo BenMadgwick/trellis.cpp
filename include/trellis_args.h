@@ -82,6 +82,26 @@ struct TrellisParams {
     bool no_fa    = false;      // disable FlashAttention (manual softmax)
     bool require_gpu = false;   // refuse CPU fallback if no GPU is usable
     int  threads  = 0;          // CPU backend thread count; 0 = all cores
+    // Sampler steps per flow. These integrate an ODE from noise to data, so the
+    // count is the RESOLUTION of that integration, not a progress counter: a
+    // 4-step run does not stop partway, it takes the whole path in four strides
+    // and arrives with more error. With the same seed it is therefore the same
+    // asset, less converged -- which is what makes a low-step preview a faithful
+    // predictor of the full run rather than a different generation.
+    //
+    // Rectified-flow trajectories are near-straight by construction, which is
+    // why few-step sampling works at all. 1 is certainly too coarse; the useful
+    // range is worth sweeping.
+    //
+    // 0 on a per-flow knob means "inherit `steps`".
+    int steps       = 12;       // all flows unless overridden below
+    int steps_ss    = 0;        // sparse structure
+    int steps_shape = 0;        // shape SLAT (both the LR and HR passes)
+    int steps_tex   = 0;        // texture SLAT
+    int ss_steps()    const { return steps_ss    > 0 ? steps_ss    : steps; }
+    int shape_steps() const { return steps_shape > 0 ? steps_shape : steps; }
+    int tex_steps()   const { return steps_tex   > 0 ? steps_tex   : steps; }
+
     float gss = 7.5f;           // sparse-structure guidance strength
     float gsh = 7.5f;           // shape-SLAT guidance strength
     // Two-stage generation. The sparse structure decode finishes in ~1-2 s while

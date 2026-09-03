@@ -102,6 +102,11 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     vector<float> cond, cond1024, neg, neg1024;
     vector<std::array<int,3>> coords;
     int vox_grid = 32, Lc = 0, Lc1024 = 0;
+    // Carried between the cache and the shape stage: what --load-vox supplied,
+    // and what --save-vox should store once the LR pass has run.
+    vector<float> cached_lr, lr_for_cache;
+    vector<std::array<int,3>> cached_hr_coords, hr_coords_for_cache;
+    int cached_lr_steps = 0, lr_for_cache_steps = 0;
     // The negative conditioning is a zero vector of the same length, so it is
     // derived rather than stored or recomputed.
     auto size_cond = [&] {
@@ -127,6 +132,9 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         coords   = std::move(vc.coords);
         cond     = std::move(vc.cond);
         cond1024 = std::move(vc.cond1024);
+        cached_lr = std::move(vc.lr_slat);
+        cached_hr_coords = std::move(vc.hr_coords);
+        cached_lr_steps = vc.lr_steps;
         size_cond();   // cascade is now the cached one, so this must follow it
     } else {
 
@@ -194,7 +202,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         trellis::DiTParams p; p.in_ch = 8; p.out_ch = 8; p.d_cond = 1024; p.cast_f32 = F32;
         trellis::DitRunner* run = trellis::make_dense_runner(m, p, 16, Lc);
         trellis::FlowFwd fwd = [&](const vector<float>& x, float ts, const float* c){ return run->forward(x, ts, c); };
-        trellis::SamplerParams sp; sp.steps=12; sp.guidance_strength=cfg.gss; sp.guidance_rescale=0.7f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=5.0f;
+        trellis::SamplerParams sp; sp.steps=cfg.ss_steps(); sp.guidance_strength=cfg.gss; sp.guidance_rescale=0.7f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=5.0f;
         vector<float> z = trellis::sample_flow(fwd, noise(8*4096), cond.data(), neg.data(), sp);  // [8,4096] ne0=8
         delete run; m.free();
         // transpose [8,L] -> torch [8,16,16,16] memory (c*4096 + sp)
@@ -235,13 +243,13 @@ int trellis_run(const trellis::TrellisParams& cfg) {
 
     // one shape SLAT flow run -> normalized [32,n] (sparse, CFG 7.5, gi[0.6,1], rescale_t 3)
     auto shape_flow = [&](const std::string& path, const vector<std::array<int,3>>& cds,
-                          const float* cnd, const float* ncnd, int lc) {
+                          const float* cnd, const float* ncnd, int lc, int steps) {
         const int n = (int)cds.size();
         trellis::Model m = trellis::Model::load(path, gpu);
         trellis::DiTParams p; p.in_ch = 32; p.out_ch = 32; p.d_cond = 1024; p.cast_f32 = F32;
         trellis::DitRunner* run = trellis::make_sparse_runner(m, p, cds, lc);
         trellis::FlowFwd fwd = [&](const vector<float>& x, float ts, const float* c){ return run->forward(x, ts, c); };
-        trellis::SamplerParams sp; sp.steps=12; sp.guidance_strength=cfg.gsh; sp.guidance_rescale=0.5f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=3.0f;
+        trellis::SamplerParams sp; sp.steps=steps; sp.guidance_strength=cfg.gsh; sp.guidance_rescale=0.5f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=3.0f;
         vector<float> sn = trellis::sample_flow(fwd, noise((size_t)32*n), cnd, ncnd, sp);   // [32,n]
         delete run; m.free();
         return sn;
@@ -268,16 +276,49 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         const int hr_target = cfg.hr_res;
         const int max_tok   = cfg.max_tokens;
         printf("[4/7] shape SLAT flow (LR 512 -> upsample -> HR %d cascade, max_tok=%d)\n", hr_target, max_tok);
-        // (1) LR shape flow @res32 with cond_512
-        lr_norm = shape_flow(M + "/shape_flow_512.gguf", coords, cond.data(), neg.data(), Lc);
-        lr_dn.resize(lr_norm.size());
-        for (size_t n = 0; n < coords.size(); ++n) for (int c = 0; c < 32; ++c)
-            lr_dn[(size_t)c + 32*n] = lr_norm[(size_t)c + 32*n]*SHAPE_STD[c] + SHAPE_MEAN[c];
-        slat_stats("LR slat (res32, decodes OK via upsample)", lr_dn);
-        // (2) decoder.upsample(LR slat, 4) -> res512 coords
+        // (1) LR shape flow @res32 with cond_512, or the cache's copy of it.
+        //
+        // The LR pass is cheap but sets the COARSE STRUCTURE, so sharing it
+        // between a low-step preview and the full run makes the preview a
+        // faithful predictor rather than merely a cheaper one -- both then start
+        // the HR flow from identical geometry. Only reused when it was sampled
+        // with AT LEAST as many steps as this run wants, so a full run never
+        // silently inherits a 4-step structure from a preview.
         vector<std::array<int,3>> hr_coords;
-        { trellis::Model m = trellis::Model::load(M + "/shape_dec.gguf", gpu);
-          hr_coords = trellis::shape_upsample(m, lr_dn, coords); m.free(); }
+        if (!cached_lr.empty() && cached_lr_steps >= cfg.shape_steps() && !cached_hr_coords.empty()) {
+            lr_dn = cached_lr;
+            hr_coords = cached_hr_coords;
+            printf("      LR slat + upsampled coords reused from the cache (%d steps, %zu coords)\n",
+                   cached_lr_steps, hr_coords.size());
+        } else {
+            if (!cached_lr.empty())
+                printf("      cached LR slat is %d steps, this run wants %d; recomputing\n",
+                       cached_lr_steps, cfg.shape_steps());
+            lr_norm = shape_flow(M + "/shape_flow_512.gguf", coords, cond.data(), neg.data(), Lc, cfg.shape_steps());
+            lr_dn.resize(lr_norm.size());
+            for (size_t n = 0; n < coords.size(); ++n) for (int c = 0; c < 32; ++c)
+                lr_dn[(size_t)c + 32*n] = lr_norm[(size_t)c + 32*n]*SHAPE_STD[c] + SHAPE_MEAN[c];
+            slat_stats("LR slat (res32, decodes OK via upsample)", lr_dn);
+            // (2) decoder.upsample(LR slat, 4) -> res512 coords
+            trellis::Model m = trellis::Model::load(M + "/shape_dec.gguf", gpu);
+            hr_coords = trellis::shape_upsample(m, lr_dn, coords); m.free();
+        }
+        lr_for_cache = lr_dn;
+        lr_for_cache_steps = cfg.shape_steps();
+        hr_coords_for_cache = hr_coords;
+        // Enrich the cache now that the LR result exists, so a later run starts
+        // at the HR flow. Only when this run actually computed it -- otherwise we
+        // would rewrite what we just read, and a lower step count would overwrite
+        // a better one.
+        if (!cfg.save_vox.empty() && lr_for_cache_steps > cached_lr_steps) {
+            trellis::VoxCache vc;
+            vc.cascade = cascade; vc.hr_res = cfg.hr_res; vc.grid = vox_grid; vc.seed = run_seed;
+            vc.coords = coords; vc.cond = cond; vc.cond1024 = cond1024;
+            vc.lr_steps = lr_for_cache_steps;
+            vc.lr_slat = lr_for_cache;
+            vc.hr_coords = hr_coords_for_cache;
+            trellis::save_vox_cache(cfg.save_vox, vc);
+        }
         // (3) quantize res512 -> res(hr_res//16) with the reference's adaptive token-budget backoff
         //     (sample_shape_slat_cascade): start at hr_target, step -128 toward the 1024 floor while
         //     the unique token count would exceed max_num_tokens. grid = hr_res//16 is integral since
@@ -326,12 +367,12 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             hr_res -= 128;
         }
         // (4) HR shape flow @res(hr_res//16) with cond_1024
-        slat_norm = shape_flow(M + "/shape_flow_1024.gguf", shc, cond1024.data(), neg1024.data(), Lc1024);
+        slat_norm = shape_flow(M + "/shape_flow_1024.gguf", shc, cond1024.data(), neg1024.data(), Lc1024, cfg.shape_steps());
         RES = hr_res; cond_dec = cond1024.data(); neg_dec = neg1024.data(); Lc_dec = Lc1024;
     } else {
         printf("[4/7] shape SLAT flow (512)\n");
         shc = coords;
-        slat_norm = shape_flow(M + "/shape_flow_512.gguf", coords, cond.data(), neg.data(), Lc);
+        slat_norm = shape_flow(M + "/shape_flow_512.gguf", coords, cond.data(), neg.data(), Lc, cfg.shape_steps());
     }
     const int N = (int)shc.size();
     slat_dn.resize(slat_norm.size());
@@ -418,7 +459,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                 }
                 return run->forward(x64, ts, c);
             };
-            trellis::SamplerParams sp; sp.steps=12; sp.guidance_strength=1.0f; sp.guidance_rescale=0.0f; sp.gi0=0.6f; sp.gi1=0.9f; sp.rescale_t=3.0f;
+            trellis::SamplerParams sp; sp.steps=cfg.tex_steps(); sp.guidance_strength=1.0f; sp.guidance_rescale=0.0f; sp.gi0=0.6f; sp.gi1=0.9f; sp.rescale_t=3.0f;
             texlat = trellis::sample_flow(fwd, noise((size_t)32*tN), tcond, tneg, sp);  // [32,tN]
             delete run; m.free();
             for (int n = 0; n < tN; ++n) for (int c = 0; c < 32; ++c) texlat[(size_t)c + 32*n] = texlat[(size_t)c + 32*n]*TEX_STD[c] + TEX_MEAN[c];
