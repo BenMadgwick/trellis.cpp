@@ -12,6 +12,7 @@
 #include "uv_bake.h"
 #include "tri_bvh.h"
 #include "remesh_dc.h"
+#include "remesh_stage.h"
 #include "mesh_audit.h"
 #include "vox_preview.h"
 #include "vox_cache.h"
@@ -46,21 +47,8 @@ static void slat_stats(const char* tag, const vector<float>& v) {
            tag, v.size(), mean, var > 0 ? std::sqrt(var) : 0.0, mn, mx, bad);
 }
 
-// Boundary edges per 1000 faces over the welded index space. The `auto` mode's
-// gate: it reads the finished output rather than predicting from the input,
-// because Interior's only failure modes show up there.
-static double open_per_1k(const std::vector<int32_t>& faces) {
-    const size_t F = faces.size() / 3;
-    if (F == 0) return 1e9;
-    std::unordered_map<uint64_t,int> e;
-    e.reserve(F * 2);
-    auto k = [](int a, int b){ if (a>b){int t=a;a=b;b=t;} return ((uint64_t)(uint32_t)a<<32)|(uint32_t)b; };
-    for (size_t f = 0; f < F; ++f)
-        for (int j = 0; j < 3; ++j) e[k(faces[3*f+j], faces[3*f+(j+1)%3])]++;
-    size_t nb = 0;
-    for (auto& kv : e) if (kv.second == 1) ++nb;
-    return 1000.0 * (double)nb / (double)F;
-}
+// open_per_1k moved to remesh_stage.h, shared with post-replay -- the `auto`
+// gate reads it and there was a second, differently-implemented copy there.
 
 static const float SHAPE_MEAN[32]={0.781296f,0.018091f,-0.495192f,-0.558457f,1.060530f,0.093252f,1.518149f,-0.933218f,-0.732996f,2.604095f,-0.118341f,-2.143904f,0.495076f,-2.179512f,-2.130751f,-0.996944f,0.261421f,-2.217463f,1.260067f,-0.150213f,3.790713f,1.481266f,-1.046058f,-1.523667f,-0.059621f,2.220780f,1.621212f,0.877230f,0.567247f,-3.175944f,-3.186688f,1.578665f};
 static const float SHAPE_STD[32]={5.972266f,4.706852f,5.445010f,5.209927f,5.320220f,4.547237f,5.020802f,5.444004f,5.226681f,5.683095f,4.831436f,5.286469f,5.652043f,5.367606f,5.525084f,4.730578f,4.805265f,5.124013f,5.530808f,5.619001f,5.103930f,5.417670f,5.269677f,5.547194f,5.634698f,5.235274f,6.110351f,5.511298f,6.237273f,4.879207f,5.347008f,5.405691f};
@@ -613,49 +601,29 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // scales with resolution to keep the offset resolution-independent (512->1,
         // 1024->2, 1536->3); an explicit --band / per-request band forces that value.
         int remesh_band = cfg.band > 0 ? cfg.band : std::max(1, so.res / 512);
-        trellis::Mesh rm;
         // Clean the narrow-band DC output (drop degenerate faces, unify winding), then drop
         // decode floaters (the reference is a single watertight component; ours shattered into
         // 50+ pieces). The faithful QEM simplifier below handles surface smoothing via its
         // quadric + skinny-triangle cost, so no Taubin pre-pass is needed (and none is applied,
         // which keeps the mesh aligned to the voxel PBR volume for correct texture sampling).
-        auto build_remesh = [&](trellis::RemeshMode m) -> double {
-            rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(),
-                                                mesh.faces.data(), mesh.F(),
-                                                bvh, so.res, remesh_band,
-                                                cfg.remesh_project, m, cfg.sign_rays, nullptr, cfg.parity_coarse);
-            if (rm.F() == 0) return 1e9;
-            trellis::clean_mesh(rm.V(), rm.faces);
-            int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
-            printf("  remesh postproc: dropped %d floater comps -> V=%d F=%d\n", ndrop, rm.V(), rm.F());
-            fflush(stdout);
-            if (m == trellis::RemeshMode::Unsigned) return 0.0;
-            // Round holes wider than the band's own lip survive contouring as
-            // clean rims; fan them now so QEM is never forced to preserve rim
-            // vertices and the normal bake never sees a hole.
-            if (cfg.fill_hipoly > 0.0f) {
-                const int nfill = trellis::fill_holes(rm.verts, rm.faces, cfg.fill_hipoly);
-                if (nfill) { printf("  remesh postproc: fan-filled %d high-poly holes\n", nfill); fflush(stdout); }
-            }
-            // Meaningful only on a closed output: its cavities are genuinely
-            // enclosed, rather than being the exterior seen from between two
-            // sheets of a double cover.
-            if (cfg.cull) trellis::cull_enclosed_components(rm.verts, rm.faces, 256);
-            return open_per_1k(rm.faces);
-        };
-        const double open1k = build_remesh(rmode);
-        if (mode_auto && rmode != trellis::RemeshMode::Unsigned) {
-            const size_t nf = rm.faces.size() / 3;
-            if (nf < 10000 || open1k > 5.0) {
-                printf("  remesh: interior mode failed (faces=%zu, open/1k=%.2f); "
-                       "falling back to unsigned + strip\n", nf, open1k);
-                fflush(stdout);
-                rm = trellis::Mesh();
-                build_remesh(trellis::RemeshMode::Unsigned);
-                final_mode = trellis::RemeshMode::Unsigned;
-                want_strip = true;
-            }
-        }
+        //
+        // Steps 3-6 and the `auto` gate live in remesh_stage() -- shared with
+        // post-replay, which had its own copy of both.
+        trellis::RemeshStageOpts ro;
+        ro.res           = so.res;
+        ro.band          = cfg.band;          // 0 => the same auto rule as remesh_band above
+        ro.project       = cfg.remesh_project;
+        ro.mode          = rmode;
+        ro.mode_auto     = mode_auto;
+        ro.sign_rays     = cfg.sign_rays;
+        ro.parity_coarse = cfg.parity_coarse;
+        ro.cull          = cfg.cull;
+        ro.fill_hipoly   = cfg.fill_hipoly;
+        trellis::RemeshStageResult rs =
+            trellis::remesh_stage(mesh.verts, mesh.faces, bvh, ro, cfg.strip_interior);
+        trellis::Mesh& rm = rs.mesh;
+        final_mode = rs.final_mode;
+        want_strip = rs.want_strip;
         std::vector<float>& sverts = rm.F() > 0 ? rm.verts : mesh.verts;
         std::vector<int32_t>& sfaces = rm.F() > 0 ? rm.faces : mesh.faces;
 

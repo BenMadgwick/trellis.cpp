@@ -15,6 +15,7 @@
 #include "uv_bake.h"
 #include "tri_bvh.h"
 #include "remesh_dc.h"
+#include "remesh_stage.h"
 #include "mesh_audit.h"
 #include "strip_interior.h"
 #include "shading.h"
@@ -348,55 +349,32 @@ int main(int argc, char** argv) {
     if (do_remesh && !cached) {
         const int rres = remesh_res > 0 ? remesh_res : res;
         if (rres != res) printf("  remesh at grid %d (dump res %d)\n", rres, res);
-        // Steps 3-6. Returns boundary edges on the finished high-poly, which is
-        // what the `auto` gate reads.
-        auto build = [&](trellis::RemeshMode m) -> size_t {
-            rm = trellis::remesh_narrow_band_dc(verts.data(), (int64_t)verts.size()/3,
-                                                faces.data(), (int64_t)faces.size()/3, bvh, rres, band,
-                                                remesh_project, m, sign_rays, sign_dump, parity_coarse);
-            printf("  [remesh %.1fs]\n", now()-t); t = now();
-            audit("remesh", rm.faces);
-            if (rm.F() == 0) return 0;
-            // match the CLI: clean degenerates/unify winding, drop floater components
-            trellis::clean_mesh(rm.V(), rm.faces);
-            audit("clean_mesh", rm.faces);
-            const int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);
-            printf("  [clean+drop %.1fs] dropped=%d\n", now()-t, ndrop); t = now();
-            size_t nb = audit("drop_components", rm.faces);
-            if (m == trellis::RemeshMode::Unsigned) return nb;
-            // Step 5. Round holes wider than the band's lip come through as
-            // clean rims; fan them here so QEM and the normal bake see a closed
-            // surface. (Slits narrower than 2*eps sealed themselves under the
-            // lip, which is why the unsigned path never needed this.)
-            if (fill_hipoly > 0.0f) {
-                const int nfill = trellis::fill_holes(rm.verts, rm.faces, fill_hipoly);
-                printf("  [fill_holes %.1fs] filled=%d (max perimeter %.3f)\n", now()-t, nfill, fill_hipoly); t = now();
-                nb = audit("fill_holes", rm.faces);
-            }
-            // Step 6. Only meaningful now: the output is closed, so its cavities
-            // are genuinely enclosed rather than being the exterior in disguise.
-            if (do_cull) {
-                trellis::cull_enclosed_components(rm.verts, rm.faces, 256);
-                printf("  [cull %.1fs]\n", now()-t); t = now();
-                nb = audit("cull", rm.faces);
-            }
-            return nb;
-        };
-        const size_t nb = build(rmode);
-        // The gate the design puts on the OUTPUT rather than the input: the only
-        // failure modes Interior has are closed artefacts, so an input predictor
-        // would be guessing at something the output states directly.
-        if (mode_auto && rmode != trellis::RemeshMode::Unsigned) {
-            const size_t nf = rm.faces.size() / 3;
-            const double open1k = nf ? 1000.0 * (double)nb / (double)nf : 1e9;
-            if (nf < 10000 || open1k > 5.0) {
-                fprintf(stderr, "  [remesh] interior mode failed (faces=%zu, open/1k=%.2f); "
-                                "falling back to unsigned + strip\n", nf, open1k);
-                rm = trellis::Mesh();
-                build(trellis::RemeshMode::Unsigned);
-                do_strip = true;
-            }
-        }
+        // Steps 3-6 and the `auto` gate now live in remesh_stage(), shared with
+        // trellis-cli. This file had its own copy of both, reaching the same
+        // thresholds through a different open-edge count -- and its fallback
+        // left `rmode` stale, so the single-cover checks below could still read
+        // Interior after having built Unsigned.
+        trellis::RemeshStageOpts ro;
+        ro.res           = rres;
+        ro.band          = band;   // NOTE: defaults to 1 here and to 0 (auto ->
+                                   // res/512, i.e. 2 at res 1024) in trellis-cli,
+                                   // so a default replay contours a thinner shell
+                                   // than the run it replays. Preserved, not fixed.
+        ro.project       = remesh_project;
+        ro.mode          = rmode;
+        ro.mode_auto     = mode_auto;
+        ro.sign_rays     = sign_rays;
+        ro.parity_coarse = parity_coarse;
+        ro.cull          = do_cull;
+        ro.fill_hipoly   = fill_hipoly;
+        ro.sign_dump     = sign_dump;
+        ro.verbose       = true;   // this is the harness: keep the per-stage timings
+        ro.on_stage      = [](const char* tag, const std::vector<int32_t>& f) { audit(tag, f); };
+        trellis::RemeshStageResult rs = trellis::remesh_stage(verts, faces, bvh, ro, do_strip);
+        rm       = std::move(rs.mesh);
+        rmode    = rs.final_mode;
+        do_strip = rs.want_strip;
+        t = now();
     }
     std::vector<float>& sverts = rm.F() > 0 ? rm.verts : verts;
     std::vector<int32_t>& sfaces = rm.F() > 0 ? rm.faces : faces;

@@ -109,6 +109,7 @@ add_library(trellis_core STATIC
   src/decimate_qem.cpp
   src/strip_interior.cpp
   src/mesh_audit.cpp
+  src/remesh_stage.cpp
   src/vox_preview.cpp
   src/vox_cache.cpp
 )
