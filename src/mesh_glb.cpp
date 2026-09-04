@@ -1,4 +1,5 @@
 #include "mesh_glb.h"
+#include "atomic_file.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -210,6 +211,15 @@ static std::string asset_copyright_json(const char* copyright) {
     return s;
 }
 
+std::string tier_path(const std::string& base, int faces) {
+    const size_t dot = base.find_last_of('.');
+    const size_t sep = base.find_last_of("/\\");
+    const bool has_ext = dot != std::string::npos && (sep == std::string::npos || dot > sep);
+    char n[32];
+    std::snprintf(n, sizeof(n), "_%d", faces);
+    return has_ext ? base.substr(0, dot) + n + base.substr(dot) : base + n;
+}
+
 bool write_glb(const char* path, const float* verts, int64_t V, const int32_t* faces, int64_t F,
                const float* colors, int64_t seed, const char* copyright) {
     // 1. rotate (x,y,z)->(x,z,-y); track min/max
@@ -269,11 +279,16 @@ bool write_glb(const char* path, const float* verts, int64_t V, const int32_t* f
     w_u32(out, (uint32_t)bin.size()); w_u32(out, 0x004E4942);          // BIN chunk
     out.insert(out.end(), bin.begin(), bin.end());
 
-    FILE* f = fopen(path, "wb");
+    // Via <path>.part: a calling application reads the .glb appearing on disk as the
+    // marker that this asset FINISHED generating, so a truncated one from a
+    // killed job would be reported as a completed asset.
+    const std::string part = part_path(path);
+    FILE* f = fopen(part.c_str(), "wb");
     if (!f) return false;
     bool ok = fwrite(out.data(), 1, out.size(), f) == out.size();
     fclose(f);
-    return ok;
+    if (!ok) { discard_part(path); return false; }
+    return commit_part(path);
 }
 
 bool write_glb_textured(const char* path, const float* verts, int64_t V, const float* uv,
@@ -474,8 +489,11 @@ bool write_glb_textured(const char* path, const float* verts, int64_t V, const f
     w_u32(o,0x46546C67); w_u32(o,2); w_u32(o,total);
     w_u32(o,(uint32_t)json.size()); w_u32(o,0x4E4F534A); o.insert(o.end(),json.begin(),json.end());
     w_u32(o,(uint32_t)bin.size()); w_u32(o,0x004E4942); o.insert(o.end(),bin.begin(),bin.end());
-    FILE* f=fopen(path,"wb"); if(!f) return false;
-    bool ok=fwrite(o.data(),1,o.size(),f)==o.size(); fclose(f); return ok;
+    const std::string part = part_path(path);   // see write_glb: partial != finished
+    FILE* f=fopen(part.c_str(),"wb"); if(!f) return false;
+    bool ok=fwrite(o.data(),1,o.size(),f)==o.size(); fclose(f);
+    if (!ok) { discard_part(path); return false; }
+    return commit_part(path);
 }
 
 bool write_ply(const char* path, const float* verts, int64_t V, const int32_t* faces, int64_t F,

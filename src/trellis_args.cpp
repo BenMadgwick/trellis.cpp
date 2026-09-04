@@ -45,7 +45,11 @@ void print_usage(const char* argv0, bool server) {
         "      --no-texture        geometry only\n"
         "      --xatlas            xatlas UV unwrap (default)\n"
         "      --box-uv            voxel-native box projection (faster)\n"
-        "      --faces N           QEM face budget (default: 300K @1024 / 150K @512)\n"
+        "      --faces N[,N,...]   QEM face budget (default: 300K @1024 / 150K @512).\n"
+        "                          Several targets write one GLB each, <out>_<N>.glb;\n"
+        "                          a single target keeps the exact output path given.\n"
+        "                          A sweep is cheap: everything before decimation is\n"
+        "                          shared, so an extra tier costs only decimate + bake\n"
         "      --normal-map        bake a tangent-space normal map from the high-poly\n"
         "                          (needs a single-cover source: any --remesh-mode but\n"
         "                          'unsigned', or 'unsigned' plus --strip-interior)\n"
@@ -152,7 +156,27 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "--no-texture")           { p.texture = false; }
         else if (a == "--xatlas")               { p.xatlas = true; }
         else if (a == "--box-uv")               { p.xatlas = false; }
-        else if (a == "--faces")                { const char* v = need(a.c_str()); if (!v) return false; p.faces = atoi(v); }
+        else if (a == "--faces")                { const char* v = need(a.c_str()); if (!v) return false;
+                                                  // One target, or several: "5000", "1000,5000,10000",
+                                                  // or a quoted "1000 5000 10000". A GUI's triangle box
+                                                  // is free text and people type both separators.
+                                                  p.faces.clear();
+                                                  for (const char* s = v; *s; ) {
+                                                      while (*s == ',' || *s == ' ' || *s == '\t') ++s;
+                                                      if (!*s) break;
+                                                      char* end = nullptr;
+                                                      const long n = std::strtol(s, &end, 10);
+                                                      if (end == s) {
+                                                          fprintf(stderr, "--faces: expected numbers, got '%s'\n", v);
+                                                          return false;
+                                                      }
+                                                      if (n > 0) p.faces.push_back((int)n);
+                                                      s = end;
+                                                  }
+                                                  if (p.faces.empty()) {
+                                                      fprintf(stderr, "--faces: no positive target in '%s'\n", v);
+                                                      return false;
+                                                  } }
         else if (a == "--strip-interior")       { p.strip_interior = true; }
         else if (a == "--remesh-mode")          { const char* v = need(a.c_str()); if (!v) return false;
                                                   const std::string m = v;

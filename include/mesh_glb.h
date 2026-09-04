@@ -1,6 +1,7 @@
 // Minimal glTF 2.0 binary (.glb) writer — geometry only (POSITION + indices).
 #pragma once
 #include <cstdint>
+#include <string>
 
 namespace trellis {
 
@@ -35,6 +36,12 @@ bool write_glb_textured(const char* path, const float* verts, int64_t V, const f
 
 // Debug helper: binary little-endian PLY in raw TRELLIS space (no axis swap).
 // colors: optional [V*3] float RGB in [0,1] -> written as uchar red/green/blue per vertex.
+// Output path for one tier of a multi-target face sweep:
+// "bear.glb" + 2500 -> "bear_2500.glb". Callers only apply it when there is
+// more than one target, so a single-target run keeps the exact path it was
+// given and existing scripts see no change.
+std::string tier_path(const std::string& base, int faces);
+
 bool write_ply(const char* path, const float* verts, int64_t V, const int32_t* faces, int64_t F,
                const float* colors = nullptr);
 

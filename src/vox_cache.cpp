@@ -1,4 +1,5 @@
 #include "vox_cache.h"
+#include "atomic_file.h"
 #include <cstdint>
 #include <cstdio>
 
@@ -17,8 +18,12 @@ bool wr(FILE* f, const T& v) { return fwrite(&v, sizeof(T), 1, f) == 1; }
 }  // namespace
 
 bool save_vox_cache(const std::string& path, const VoxCache& v) {
-    FILE* f = fopen(path.c_str(), "wb");
-    if (!f) { fprintf(stderr, "      [vox] cannot write %s\n", path.c_str()); return false; }
+    // Written to <path>.part and renamed on success: a job killed mid-write --
+    // and the front end kills with killing the process tree -- must never leave a
+    // truncated cache that a later run reads back as a hit.
+    const std::string part = part_path(path);
+    FILE* f = fopen(part.c_str(), "wb");
+    if (!f) { fprintf(stderr, "      [vox] cannot write %s\n", part.c_str()); return false; }
     const uint32_t nc = (uint32_t)v.coords.size();
     const uint32_t n0 = (uint32_t)v.cond.size();
     const uint32_t n1 = (uint32_t)v.cond1024.size();
@@ -37,7 +42,12 @@ bool save_vox_cache(const std::string& path, const VoxCache& v) {
     for (uint32_t i = 0; ok && i < nhr; ++i)
         ok = fwrite(v.hr_coords[i].data(), sizeof(int), 3, f) == 3;
     fclose(f);
-    if (!ok) { fprintf(stderr, "      [vox] short write to %s\n", path.c_str()); return false; }
+    if (!ok) {
+        fprintf(stderr, "      [vox] short write to %s\n", part.c_str());
+        discard_part(path);
+        return false;
+    }
+    if (!commit_part(path)) return false;
     const double mb = ((double)(n0 + n1 + nlr) * sizeof(float)
                      + (double)nhr * 3 * sizeof(int)) / (1024.0*1024.0);
     printf("      [vox] cache -> %s (%u voxels, cond %d+%d tokens", path.c_str(), nc, v.Lc(), v.Lc1024());

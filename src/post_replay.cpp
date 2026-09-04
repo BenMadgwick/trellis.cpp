@@ -139,7 +139,9 @@ int main(int argc, char** argv) {
     const char* dump = argv[1];
     const char* out = argv[2];
     bool boxuv = false, do_weld = true, do_fill = true, do_bake = true, do_remesh = true, do_snap = true;
-    int band = 1;
+    int band = 0;   // 0 = auto (res/512): the same resolution-independent offset
+                    // trellis-cli uses. Was 1, so a default replay contoured a
+                    // THINNER shell than the run it was replaying.
     bool do_strip = false;
     trellis::StripOpts strip;
     int atlas = 2048, decim = -1;

@@ -82,8 +82,35 @@ int trellis_run(const trellis::TrellisParams& cfg) {
     // Not const: --load-vox adopts whichever the cached run used, since the
     // cached conditioning only exists for that path.
     bool cascade = cfg.cascade;
-    std::mt19937 rng(run_seed); std::normal_distribution<float> randn(0.f, 1.f);
-    auto noise = [&](size_t n){ vector<float> v(n); for (auto& x : v) x = randn(rng); return v; };
+    // Per-stage noise, NOT one shared stream.
+    //
+    // A single mt19937 for the whole run made the noise a stage reached depend
+    // on which stages had run before it. A resumed run (--load-vox skips [1]-[3])
+    // therefore arrived at the shape flow at a different position in the stream
+    // and produced a DIFFERENT ASSET from the same seed: measured on the
+    // briefcase, straight gave 769,110 upsampled coords and resumed gave 783,297
+    // from a bit-identical voxel structure.
+    //
+    // That is fatal to a content-addressed cache -- a hit (resume) and a miss
+    // (straight) would return different geometry for identical inputs -- and it
+    // quietly weakened --seed as a reproducibility handle. Deriving each stage's
+    // stream from (seed, stage) makes the two paths agree bit for bit, and
+    // leaves re-rolling exactly as it was.
+    enum NoiseStage : uint32_t { NS_STRUCTURE = 1, NS_SHAPE_LR = 2, NS_SHAPE_HR = 3, NS_TEXTURE = 4 };
+    auto noise = [&](NoiseStage stage, size_t n) {
+        // splitmix64 finaliser: decorrelates neighbouring seeds, so seed 42 and
+        // seed 43 do not hand adjacent stages near-identical streams.
+        uint64_t x = ((uint64_t)run_seed << 32) ^ ((uint64_t)stage * 0x9E3779B97F4A7C15ull);
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdull;
+        x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull;
+        x ^= x >> 33;
+        uint32_t s = (uint32_t)x ? (uint32_t)x : 1u;
+        std::mt19937 r(s);
+        std::normal_distribution<float> randn(0.f, 1.f);
+        vector<float> v(n);
+        for (auto& e : v) e = randn(r);
+        return v;
+    };
     double t0 = now();
 
     // ---- stages [1]-[3], or the cache that replaces them ----------------------
@@ -191,7 +218,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         trellis::DitRunner* run = trellis::make_dense_runner(m, p, 16, Lc);
         trellis::FlowFwd fwd = [&](const vector<float>& x, float ts, const float* c){ return run->forward(x, ts, c); };
         trellis::SamplerParams sp; sp.steps=cfg.ss_steps(); sp.guidance_strength=cfg.gss; sp.guidance_rescale=0.7f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=5.0f;
-        vector<float> z = trellis::sample_flow(fwd, noise(8*4096), cond.data(), neg.data(), sp);  // [8,4096] ne0=8
+        vector<float> z = trellis::sample_flow(fwd, noise(NS_STRUCTURE, 8*4096), cond.data(), neg.data(), sp);  // [8,4096] ne0=8
         delete run; m.free();
         // transpose [8,L] -> torch [8,16,16,16] memory (c*4096 + sp)
         vector<float> zdec(8*4096);
@@ -231,14 +258,15 @@ int trellis_run(const trellis::TrellisParams& cfg) {
 
     // one shape SLAT flow run -> normalized [32,n] (sparse, CFG 7.5, gi[0.6,1], rescale_t 3)
     auto shape_flow = [&](const std::string& path, const vector<std::array<int,3>>& cds,
-                          const float* cnd, const float* ncnd, int lc, int steps) {
+                          const float* cnd, const float* ncnd, int lc, int steps,
+                          NoiseStage stage) {
         const int n = (int)cds.size();
         trellis::Model m = trellis::Model::load(path, gpu);
         trellis::DiTParams p; p.in_ch = 32; p.out_ch = 32; p.d_cond = 1024; p.cast_f32 = F32;
         trellis::DitRunner* run = trellis::make_sparse_runner(m, p, cds, lc);
         trellis::FlowFwd fwd = [&](const vector<float>& x, float ts, const float* c){ return run->forward(x, ts, c); };
         trellis::SamplerParams sp; sp.steps=steps; sp.guidance_strength=cfg.gsh; sp.guidance_rescale=0.5f; sp.gi0=0.6f; sp.gi1=1.0f; sp.rescale_t=3.0f;
-        vector<float> sn = trellis::sample_flow(fwd, noise((size_t)32*n), cnd, ncnd, sp);   // [32,n]
+        vector<float> sn = trellis::sample_flow(fwd, noise(stage, (size_t)32*n), cnd, ncnd, sp);   // [32,n]
         delete run; m.free();
         return sn;
     };
@@ -282,7 +310,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             if (!cached_lr.empty())
                 printf("      cached LR slat is %d steps, this run wants %d; recomputing\n",
                        cached_lr_steps, cfg.shape_steps());
-            lr_norm = shape_flow(M + "/shape_flow_512.gguf", coords, cond.data(), neg.data(), Lc, cfg.shape_steps());
+            lr_norm = shape_flow(M + "/shape_flow_512.gguf", coords, cond.data(), neg.data(), Lc, cfg.shape_steps(), NS_SHAPE_LR);
             lr_dn.resize(lr_norm.size());
             for (size_t n = 0; n < coords.size(); ++n) for (int c = 0; c < 32; ++c)
                 lr_dn[(size_t)c + 32*n] = lr_norm[(size_t)c + 32*n]*SHAPE_STD[c] + SHAPE_MEAN[c];
@@ -355,12 +383,12 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             hr_res -= 128;
         }
         // (4) HR shape flow @res(hr_res//16) with cond_1024
-        slat_norm = shape_flow(M + "/shape_flow_1024.gguf", shc, cond1024.data(), neg1024.data(), Lc1024, cfg.shape_steps());
+        slat_norm = shape_flow(M + "/shape_flow_1024.gguf", shc, cond1024.data(), neg1024.data(), Lc1024, cfg.shape_steps(), NS_SHAPE_HR);
         RES = hr_res; cond_dec = cond1024.data(); neg_dec = neg1024.data(); Lc_dec = Lc1024;
     } else {
         printf("[4/7] shape SLAT flow (512)\n");
         shc = coords;
-        slat_norm = shape_flow(M + "/shape_flow_512.gguf", coords, cond.data(), neg.data(), Lc, cfg.shape_steps());
+        slat_norm = shape_flow(M + "/shape_flow_512.gguf", coords, cond.data(), neg.data(), Lc, cfg.shape_steps(), NS_SHAPE_HR);
     }
     const int N = (int)shc.size();
     slat_dn.resize(slat_norm.size());
@@ -448,7 +476,7 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                 return run->forward(x64, ts, c);
             };
             trellis::SamplerParams sp; sp.steps=cfg.tex_steps(); sp.guidance_strength=1.0f; sp.guidance_rescale=0.0f; sp.gi0=0.6f; sp.gi1=0.9f; sp.rescale_t=3.0f;
-            texlat = trellis::sample_flow(fwd, noise((size_t)32*tN), tcond, tneg, sp);  // [32,tN]
+            texlat = trellis::sample_flow(fwd, noise(NS_TEXTURE, (size_t)32*tN), tcond, tneg, sp);  // [32,tN]
             delete run; m.free();
             for (int n = 0; n < tN; ++n) for (int c = 0; c < 32; ++c) texlat[(size_t)c + 32*n] = texlat[(size_t)c + 32*n]*TEX_STD[c] + TEX_MEAN[c];
         }
@@ -646,25 +674,11 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             printf("      --strip-interior skipped: --remesh-mode %s has no buried sheet\n",
                    cfg.remesh_mode.c_str());
         }
-        std::vector<float> dv, dp; std::vector<int32_t> df;
-        if (cfg.decim > 0) {
-            trellis::decimate_cluster(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, {}, cfg.decim, dv, df, dp);
-        } else if (cfg.decim == 0) {
-            dv = sverts; df = sfaces;
-        } else {
-            // Face budget: explicit --faces wins, else the per-cascade default.
-            const int target = cfg.faces > 0 ? cfg.faces : (cascade ? 300000 : 150000);
-            trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3,
-                                  target, dv, df);
-            trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)so.res * 8.0f));
-            trellis::fill_small_holes(df);
-            // Second component pass on the decimated mesh: a hallucinated ground plane
-            // survives the dense-mesh drop (it decimates to a large flat slab) but is a
-            // small fraction here and disconnected from the body. Ref is a single component.
-            int ndrop2 = trellis::drop_small_components(dv, df, 0.03f);
-            if (ndrop2) { printf("  decimated postproc: dropped %d more comps -> F=%d\n", ndrop2, (int)df.size()/3); fflush(stdout); }
-        }
-        const int dV = (int)dv.size()/3, dF = (int)df.size()/3;
+        // Everything from here to the decimation is INDEPENDENT of the face
+        // target, which is what makes a multi-target sweep cheap: the remesh,
+        // both BVHs, the cull and the high-poly vertex normals are computed once
+        // and shared, so an extra tier costs only decimate + bake.
+        //
         // Texels are shaded straight from the per-voxel PBR volume (trilinear sampling, the
         // reference bake behavior) rather than from decimation-averaged vertex colors, so
         // full material detail survives simplification.
@@ -706,32 +720,69 @@ int trellis_run(const trellis::TrellisParams& cfg) {
             }
         }
 
-        trellis::BakedMesh bm = boxuv ? trellis::uv_box_project(dv, dV, df, dF, no_vp, T, &vox)
-                                      : trellis::uv_bake(dv, dV, df, dF, no_vp, T, &vox,
-                                                         do_normal ? &nsrc : nullptr);
-        if (!boxuv && !bm.ok()) bm = trellis::uv_chart_project(dv, dV, df, dF, no_vp, T, &vox);
-        if (bm.ok()) {
-            const bool ship_nmap = bm.has_normal_map() && bm.nrm_tangent_space;
-            trellis::write_glb_textured(outglb.c_str(), bm.verts.data(), (int64_t)bm.verts.size()/3, bm.uv.data(),
-                                        bm.faces.data(), (int64_t)bm.faces.size()/3, bm.base.data(), bm.mr.data(), bm.T,
-                                        /*double_sided=*/rm.F() == 0, run_seed,
-                                        cfg.copyright.empty() ? nullptr : cfg.copyright.c_str(),
-                                        /*use_webp=*/cfg.webp != 0,
-                                        ship_nmap ? bm.nrm.data() : nullptr,
-                                        ship_nmap ? bm.vnrm.data() : nullptr,
-                                        ship_nmap ? bm.vtan.data() : nullptr);
-            std::string tex = outglb.substr(0, outglb.find_last_of('.')) + "_base.png";
-            stbi_write_png(tex.c_str(), bm.T, bm.T, 4, bm.base.data(), bm.T*4);
-            textured = true;
-            if (ship_nmap) {
-                // Also written beside the GLB as a standalone file: consumers
-                // standalone file, and it needs its green channel inverted for
-                // rather than embedded; DirectX-convention pipelines invert green.
-                std::string nt = outglb.substr(0, outglb.find_last_of('.')) + "_normal.png";
-                stbi_write_png(nt.c_str(), bm.T, bm.T, 4, bm.nrm.data(), bm.T*4);
-                printf("      textured GLB (atlas %d, +%s, +%s)\n", bm.T, tex.c_str(), nt.c_str());
-            } else printf("      textured GLB (atlas %d, +%s)\n", bm.T, tex.c_str());
-        } else printf("      uv_bake failed; falling back to vertex colors\n");
+        // ---- per-target: decimate, bake, write --------------------------------
+        // Explicit --faces (one target or several), else the per-cascade default.
+        // --decim selects a different simplifier entirely and yields one output,
+        // so it ignores the list.
+        std::vector<int> targets = cfg.faces;
+        if (targets.empty()) targets.push_back(cascade ? 300000 : 150000);
+        if (cfg.decim >= 0) targets.assign(1, 0);
+        const bool sweep = targets.size() > 1;
+        if (sweep) {
+            printf("      face sweep:");
+            for (int tg : targets) printf(" %d", tg);
+            printf("  (remesh, BVHs and high-poly normals shared)\n");
+            fflush(stdout);
+        }
+
+        for (size_t ti = 0; ti < targets.size(); ++ti) {
+            std::vector<float> dv, dp; std::vector<int32_t> df;
+            if (cfg.decim > 0) {
+                trellis::decimate_cluster(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3, {}, cfg.decim, dv, df, dp);
+            } else if (cfg.decim == 0) {
+                dv = sverts; df = sfaces;
+            } else {
+                trellis::decimate_qem(sverts, (int)sverts.size()/3, sfaces, (int)sfaces.size()/3,
+                                      targets[ti], dv, df);
+                trellis::weld_vertices(dv, df, nullptr, 1.0f / ((float)so.res * 8.0f));
+                trellis::fill_small_holes(df);
+                // Second component pass on the decimated mesh: a hallucinated ground plane
+                // survives the dense-mesh drop (it decimates to a large flat slab) but is a
+                // small fraction here and disconnected from the body. Ref is a single component.
+                int ndrop2 = trellis::drop_small_components(dv, df, 0.03f);
+                if (ndrop2) { printf("  decimated postproc: dropped %d more comps -> F=%d\n", ndrop2, (int)df.size()/3); fflush(stdout); }
+            }
+            const int dV = (int)dv.size()/3, dF = (int)df.size()/3;
+            // One target keeps the exact path it was given; a sweep suffixes each.
+            const std::string outp = sweep ? trellis::tier_path(outglb, targets[ti]) : outglb;
+
+            trellis::BakedMesh bm = boxuv ? trellis::uv_box_project(dv, dV, df, dF, no_vp, T, &vox)
+                                          : trellis::uv_bake(dv, dV, df, dF, no_vp, T, &vox,
+                                                             do_normal ? &nsrc : nullptr);
+            if (!boxuv && !bm.ok()) bm = trellis::uv_chart_project(dv, dV, df, dF, no_vp, T, &vox);
+            if (bm.ok()) {
+                const bool ship_nmap = bm.has_normal_map() && bm.nrm_tangent_space;
+                trellis::write_glb_textured(outp.c_str(), bm.verts.data(), (int64_t)bm.verts.size()/3, bm.uv.data(),
+                                            bm.faces.data(), (int64_t)bm.faces.size()/3, bm.base.data(), bm.mr.data(), bm.T,
+                                            /*double_sided=*/rm.F() == 0, run_seed,
+                                            cfg.copyright.empty() ? nullptr : cfg.copyright.c_str(),
+                                            /*use_webp=*/cfg.webp != 0,
+                                            ship_nmap ? bm.nrm.data() : nullptr,
+                                            ship_nmap ? bm.vnrm.data() : nullptr,
+                                            ship_nmap ? bm.vtan.data() : nullptr);
+                std::string tex = outp.substr(0, outp.find_last_of('.')) + "_base.png";
+                stbi_write_png(tex.c_str(), bm.T, bm.T, 4, bm.base.data(), bm.T*4);
+                textured = true;
+                if (ship_nmap) {
+                    // Also written beside the GLB as a standalone file: consumers
+                    // that bake their own materials want the normal map on its own
+                    // rather than embedded; DirectX-convention pipelines invert green.
+                    std::string nt = outp.substr(0, outp.find_last_of('.')) + "_normal.png";
+                    stbi_write_png(nt.c_str(), bm.T, bm.T, 4, bm.nrm.data(), bm.T*4);
+                    printf("      textured GLB (%d faces, atlas %d, +%s, +%s)\n", dF, bm.T, tex.c_str(), nt.c_str());
+                } else printf("      textured GLB (%d faces, atlas %d, +%s)\n", dF, bm.T, tex.c_str());
+            } else printf("      uv_bake failed; falling back to vertex colors\n");
+        }
     }
     if (!textured)
         trellis::write_glb(outglb.c_str(), mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(),

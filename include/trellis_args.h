@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace trellis {
 
@@ -43,7 +44,13 @@ struct TrellisParams {
                                 //   2 @1024 — which suppresses the res-1024 "outer-skin"
                                 //   speckle (issue #22). >0 forces that width (e.g. 1 for
                                 //   the thin-wall reference look, 2 for a thicker shell).
-    int  faces    = -1;         // QEM face budget            (-1 => per-cascade default)
+    // QEM face budgets. Empty => the per-cascade default (300k cascade, 150k
+    // else). More than one target writes one GLB per target, suffixed
+    // <out>_<N>.glb, and a sweep is cheap because EVERYTHING before decimation
+    // is shared -- remesh, both BVHs, the cull, the high-poly vertex normals --
+    // so an extra tier costs only decimate + bake, both of which shrink fast as
+    // the target drops. A single target keeps the exact output path it was given.
+    std::vector<int> faces;
     // Which field remesh_dc contours (see RemeshMode in remesh_dc.h):
     //   "auto"     Interior, falling back to unsigned+strip if the output audit
     //              says it failed. The default: Interior's only failure modes
