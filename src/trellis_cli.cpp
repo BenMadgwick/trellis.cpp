@@ -16,6 +16,7 @@
 #include "mesh_audit.h"
 #include "vox_preview.h"
 #include "vox_cache.h"
+#include "master_cache.h"
 #include "atomic_file.h"
 #include "strip_interior.h"
 #include "shading.h"
@@ -601,30 +602,24 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         //
         // Unlike --dump-post this does not stop the run: an ordinary job leaves
         // its master behind and still produces its GLB.
+        //
+        // It records BOTH resolutions. The mesh was decoded and contoured at
+        // so.res, while the PBR volume may have been dropped to 512 against a
+        // res-1024 mesh. A consumer handed one number uses it for both, and four
+        // of the five things it drives -- weld epsilon, remesh grid, band
+        // auto-scale, normal-bake epsilon -- want the MESH resolution. Only the
+        // texel sampler wants the PBR one. See master_cache.h.
         const std::string master = !cfg.save_master.empty() ? cfg.save_master
                                  : (std::getenv("TRELLIS_DUMP_POST") ? std::getenv("TRELLIS_DUMP_POST") : std::string());
         if (!master.empty()) {
-            const std::string part = trellis::part_path(master);
-            FILE* dfp = fopen(part.c_str(), "wb");
-            if (dfp) {   // geometry mesh + the PBR volume the bake samples (may be res-512 in mixed mode)
-                int dV = mesh.V(), dFc = mesh.F(), Mv = (int)pbr_coords->size(), res = pbr_res;
-                bool ok = fwrite(&dV,4,1,dfp)==1 && fwrite(&dFc,4,1,dfp)==1
-                       && fwrite(&Mv,4,1,dfp)==1 && fwrite(&res,4,1,dfp)==1;
-                ok = ok && fwrite(mesh.verts.data(),4,(size_t)dV*3,dfp) == (size_t)dV*3;
-                ok = ok && fwrite(mesh.faces.data(),4,(size_t)dFc*3,dfp) == (size_t)dFc*3;
-                for (auto& c : *pbr_coords) { int xyz[3] = {c[0],c[1],c[2]}; if (ok) ok = fwrite(xyz,4,3,dfp)==3; }
-                ok = ok && fwrite(pbr6.data(),4,(size_t)Mv*6,dfp) == (size_t)Mv*6;
-                fclose(dfp);
-                if (!ok) {
-                    fprintf(stderr, "      [master] short write to %s\n", part.c_str());
-                    trellis::discard_part(master);
-                } else if (trellis::commit_part(master)) {
-                    const double mb = ((double)dV*3*4 + (double)dFc*3*4
-                                     + (double)Mv*3*4 + (double)Mv*6*4) / (1024.0*1024.0);
-                    printf("      [master] %s (V=%d F=%d, PBR=%d @res%d, %.0f MB)\n",
-                           master.c_str(), dV, dFc, Mv, res, mb);
-                }
-            } else fprintf(stderr, "      [master] cannot write %s\n", part.c_str());
+            trellis::Master mc;
+            mc.mesh_res = so.res;
+            mc.pbr_res  = pbr_res;
+            mc.verts    = mesh.verts;
+            mc.faces    = mesh.faces;
+            mc.coords   = *pbr_coords;
+            mc.pbr6     = pbr6;
+            trellis::save_master(master, mc);
         }
         trellis::weld_vertices(mesh.verts, mesh.faces, colors.empty() ? nullptr : &colors,
                                1.0f / ((float)so.res * 8.0f));

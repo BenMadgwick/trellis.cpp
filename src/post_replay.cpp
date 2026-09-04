@@ -16,6 +16,7 @@
 #include "tri_bvh.h"
 #include "remesh_dc.h"
 #include "remesh_stage.h"
+#include "master_cache.h"
 #include "mesh_audit.h"
 #include "strip_interior.h"
 #include "shading.h"
@@ -268,31 +269,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    FILE* f = fopen(dump, "rb");
-    if (!f) { fprintf(stderr, "cannot open %s\n", dump); return 1; }
-    int V = 0, F = 0, Mv = 0, res = 0;
-    // Read the four header fields as separate statements. Summing four fread
-    // calls in one expression leaves them unsequenced, so a compiler is free to
-    // run them right-to-left (MSVC does) and the fields land in the wrong
-    // variables - the sum is still 4, so the check passes and the next read
-    // asks for the wrong byte count.
-    const bool hdr = fread(&V,4,1,f) == 1 && fread(&F,4,1,f) == 1
-                  && fread(&Mv,4,1,f) == 1 && fread(&res,4,1,f) == 1;
-    if (!hdr) { fprintf(stderr, "%s: truncated header\n", dump); fclose(f); return 1; }
-    if (V <= 0 || F <= 0 || Mv < 0 || res <= 0) {
-        fprintf(stderr, "%s: implausible header V=%d F=%d voxels=%d res=%d\n", dump, V, F, Mv, res);
-        fclose(f); return 1;
-    }
-    std::vector<float> verts((size_t)V*3);
-    std::vector<int32_t> faces((size_t)F*3);
-    std::vector<std::array<int,3>> coords((size_t)Mv);
-    std::vector<float> pbr6((size_t)Mv*6);
-    if (fread(verts.data(),4,verts.size(),f) != verts.size()) { fprintf(stderr, "%s: short read (verts)\n", dump); fclose(f); return 1; }
-    if (fread(faces.data(),4,faces.size(),f) != faces.size()) { fprintf(stderr, "%s: short read (faces)\n", dump); fclose(f); return 1; }
-    for (auto& c : coords) if (fread(c.data(),4,3,f) != 3) { fprintf(stderr, "%s: short read (voxel coords)\n", dump); fclose(f); return 1; }
-    if (fread(pbr6.data(),4,pbr6.size(),f) != pbr6.size()) { fprintf(stderr, "%s: short read (pbr)\n", dump); fclose(f); return 1; }
-    fclose(f);
-    printf("loaded: V=%d F=%d voxels=%d res=%d\n", V, F, Mv, res);
+    // Both layouts are accepted; the legacy one warns that its single `res`
+    // field is standing in for two different resolutions. See master_cache.h.
+    trellis::Master mc;
+    if (!trellis::load_master(dump, mc)) return 1;
+    std::vector<float>& verts = mc.verts;
+    std::vector<int32_t>& faces = mc.faces;
+    std::vector<std::array<int,3>>& coords = mc.coords;
+    std::vector<float>& pbr6 = mc.pbr6;
+    const int V = mc.V(), F = mc.F(), Mv = mc.Mv();
+    // `res` drives the weld epsilon, the remesh grid, the band auto-scale and
+    // the normal-bake epsilon -- all properties of the MESH. The PBR volume has
+    // its own resolution and only the texel sampler wants it.
+    const int res = mc.mesh_res;
+    const int pbr_res = mc.pbr_res;
+    (void)V; (void)F;
     {
         // Volume/area of the INPUT, before any remeshing. Says whether the
         // decoded mesh is already two-walled (ratio ~ half the wall separation)
@@ -425,7 +416,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    VoxelPbr vox{&coords, &pbr6, res, do_snap ? &bvh : nullptr};
+    VoxelPbr vox{&coords, &pbr6, pbr_res, do_snap ? &bvh : nullptr};   // the ONE use that wants the PBR resolution
     const std::vector<float> no_vp;
 
     // High-poly source for the normal bake: the stripped shell, plus its own

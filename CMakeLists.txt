@@ -110,6 +110,7 @@ add_library(trellis_core STATIC
   src/strip_interior.cpp
   src/mesh_audit.cpp
   src/remesh_stage.cpp
+  src/master_cache.cpp
   src/vox_preview.cpp
   src/vox_cache.cpp
 )
