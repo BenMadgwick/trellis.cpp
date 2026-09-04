@@ -6,11 +6,11 @@
 //   * The resume cache and the master. A truncated one read back as a cache HIT
 //     is worse than a miss -- it is a wrong answer that looks like a right one.
 //
-//   * The output GLB. The web front end treats the .glb appearing on disk as the
-//     marker that an asset's generation FINISHED (job_progress() in
-//     a calling application), so a half-written one is reported as a completed asset.
+//   * The output GLB. A calling application that watches for the .glb appearing
+//     on disk treats that as the marker that generation FINISHED, so a
+//     half-written one is reported as a completed asset.
 //
-// And the front end kills jobs with `killing the process tree`, which can land anywhere --
+// And a caller that cancels by killing the process tree can land anywhere --
 // including the middle of a 10 MB write.
 #pragma once
 #include <cstdio>

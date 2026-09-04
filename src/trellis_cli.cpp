@@ -804,7 +804,8 @@ int trellis_run(const trellis::TrellisParams& cfg) {
                 if (ship_nmap) {
                     // Also written beside the GLB as a standalone file: consumers
                     // that bake their own materials want the normal map on its own
-                    // rather than embedded; DirectX-convention pipelines invert green.
+                    // rather than embedded, and a DirectX-convention pipeline needs
+                    // its green channel inverted (OpenGL convention is written here).
                     std::string nt = outp.substr(0, outp.find_last_of('.')) + "_normal.png";
                     stbi_write_png(nt.c_str(), bm.T, bm.T, 4, bm.nrm.data(), bm.T*4);
                     printf("      textured GLB (%d faces, atlas %d, +%s, +%s)\n", dF, bm.T, tex.c_str(), nt.c_str());

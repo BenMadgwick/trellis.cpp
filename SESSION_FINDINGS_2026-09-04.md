@@ -1,8 +1,8 @@
-# Findings, 2026-09-04 — measurements that correct the earlier design notes
+# Findings, 2026-09-04 — measured behaviour of the offramp and cache paths
 
-Written during the session that merged upstream, released v0.7.0, and started
-the shared-pipeline refactor. Everything here is **measured**, not estimated,
-and several items **supersede** figures in `the earlier design notes`.
+Measured while adding the resume cache, the multi-target face sweep and the
+per-stage RNG. Everything here is measured rather than estimated, and several
+items correct earlier ESTIMATES that were never measured.
 
 All numbers: container_briefcase, seed 42, default steps, RTX 3080 Laptop,
 sm_86 dev build, machine otherwise idle.
@@ -22,13 +22,13 @@ sm_86 dev build, machine otherwise idle.
 **Overhead of splitting = 336.6 − 328.0 = 8.6 s (2.6%).** That is process
 restart, CUDA re-init, and a 20 MB `.vox` write plus read.
 
-**Supersedes the earlier design notes §5**, which put preview-then-accept at ~180 s extra on
+**Corrects an earlier estimate**, which put preview-then-accept at ~180 s extra on
 an accepted job and concluded it "pays off above roughly a 40% reject rate".
 At 2.6% the gate is worth having even at a near-zero reject rate.
 
 ### The "~55 s fixed overhead" is a cold-cache constant
 
-the earlier design notes §3.2 describes ~55 s of fixed overhead that "does NOT shrink with
+An earlier note described ~55 s of fixed overhead that "does NOT shrink with
 steps". The cold-to-warm gap here is **53.7 s**. That strongly suggests the
 figure was measuring the first read of 6.3 GB of GGUF weights from disk, not a
 per-run cost: on a busy shared machine the weights stay in the OS file cache and
@@ -74,7 +74,7 @@ when the cached run actually ran the LR pass, and `--vox-only` stops before it.
 
 ## 2b. A low-step preview is faithful ONLY when the structure is shared
 
-`the earlier design notes` §2.2 recommends `--steps 4` for previews on the strength of a
+An earlier note recommended `--steps 4` for previews on the strength of a
 table showing HR tokens within 0.81% of the 12-step value. That table was taken
 **"same seed, same cache"** — i.e. resumed, with the voxel structure loaded and
 held fixed — so it measured what `steps` does to the shape and texture flows
@@ -98,9 +98,9 @@ Consequences:
   "optimising" the gate to `--steps 4` and silently making the preview a
   prediction of an asset nobody is going to build.
 - `--steps` as a cheap preview knob is only sound *downstream of a shared
-  structure*, i.e. on the `--load-vox` path. That is exactly where the handoff
-  measured it, which is why the table is right and the recommendation drawn
-  from it is not.
+  structure*, i.e. on the `--load-vox` path. That is exactly where the earlier
+  table was measured, which is why the table is right and the recommendation
+  drawn from it is not.
 
 ---
 
