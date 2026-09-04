@@ -109,6 +109,10 @@ void print_usage(const char* argv0, bool server) {
         "                          subject (measured: over an hour on a 34.6 M-face pallet)\n"
         "      --tex-only          stop there, skipping the mesh stage entirely\n"
         "      --dump-bg           also write the background-removal cutout as <out>_cutout.png\n"
+        "      --save-master PATH  write the master (decoded mesh + sparse PBR volume) to PATH\n"
+        "                          and CONTINUE. post-replay re-decimates it to any face\n"
+        "                          target without re-running a neural stage, so one master\n"
+        "                          serves every triangle budget you ask for later\n"
         "      --dump-post PATH    write the raw decoded mesh + sparse PBR volume to PATH and\n"
         "                          exit (skips remesh/decimate/UV/bake/GLB) -- for external\n"
         "                          post-processing pipelines\n"
@@ -195,6 +199,7 @@ bool parse_args(int argc, char** argv, TrellisParams& p) {
         else if (a == "--normal-min-dot")       { const char* v = need(a.c_str()); if (!v) return false; p.normal_min_dot = (float)atof(v); }
         else if (a == "--normal-cap-shells")    { const char* v = need(a.c_str()); if (!v) return false; p.normal_cap_shells = (float)atof(v); }
         else if (a == "--dump-post")            { const char* v = need(a.c_str()); if (!v) return false; p.dump_post = v; }
+        else if (a == "--save-master")          { const char* v = need(a.c_str()); if (!v) return false; p.save_master = v; }
         else if (a == "--band")                 { const char* v = need(a.c_str()); if (!v) return false; p.band = atoi(v); }
         else if (a == "--decim")                { const char* v = need(a.c_str()); if (!v) return false; p.decim = atoi(v); }
         else if (a == "--atlas" || a == "--tex"){ const char* v = need(a.c_str()); if (!v) return false; p.tex = atoi(v); }

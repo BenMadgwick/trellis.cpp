@@ -128,6 +128,11 @@ struct TrellisParams {
     // came before.
     bool tex_only = false;      // stop after the PBR decode, before post-processing
     std::string tex_render;     // write a coloured 8-view voxel preview here
+    // The master: decoded mesh + PBR volume, written mid-run and consumed by
+    // post-replay to re-decimate to any face target without re-running a single
+    // neural stage. Unlike --dump-post the run CONTINUES, so an ordinary job
+    // leaves its master behind and still produces its GLB.
+    std::string save_master;
 
     bool voxply = false;        // dump out/myvox.ply              (debug)
     bool dump_slat = false;     // dump /tmp/hr_slat.bin           (debug)

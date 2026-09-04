@@ -16,6 +16,7 @@
 #include "mesh_audit.h"
 #include "vox_preview.h"
 #include "vox_cache.h"
+#include "atomic_file.h"
 #include "strip_interior.h"
 #include "shading.h"
 #include "stb_image_write.h"
@@ -585,18 +586,45 @@ int trellis_run(const trellis::TrellisParams& cfg) {
         // occlusion-aware bucket assignment + depth-tested raster keep its bleed low.
         const bool boxuv = !cfg.xatlas;
         const int T = cfg.tex >= 0 ? cfg.tex : (cascade ? 2048 : 1024);
-        if (const char* dp = std::getenv("TRELLIS_DUMP_POST")) {
-            FILE* dfp = fopen(dp, "wb");
+        // THE MASTER: the decoded mesh plus the PBR volume the bake samples --
+        // everything the neural stages produce, before any BUDGET decision is
+        // taken. Triangle target, atlas size and texture format are all choices
+        // made downstream of this one artifact, which is why a single master
+        // serves any number of face targets: post-replay consumes it and
+        // re-decimates without touching a neural stage.
+        //
+        // Deliberately the PRE-remesh mesh, matching what post-replay expects
+        // (it welds, fills, dedupes, builds its BVH and remeshes what it loads)
+        // and what the TRELLIS_DUMP_POST env has always written. --dump-post is
+        // the odd one out: it writes the POST-remesh mesh, so feeding its output
+        // to post-replay remeshes an already-offset surface. Keep them distinct.
+        //
+        // Unlike --dump-post this does not stop the run: an ordinary job leaves
+        // its master behind and still produces its GLB.
+        const std::string master = !cfg.save_master.empty() ? cfg.save_master
+                                 : (std::getenv("TRELLIS_DUMP_POST") ? std::getenv("TRELLIS_DUMP_POST") : std::string());
+        if (!master.empty()) {
+            const std::string part = trellis::part_path(master);
+            FILE* dfp = fopen(part.c_str(), "wb");
             if (dfp) {   // geometry mesh + the PBR volume the bake samples (may be res-512 in mixed mode)
                 int dV = mesh.V(), dFc = mesh.F(), Mv = (int)pbr_coords->size(), res = pbr_res;
-                fwrite(&dV,4,1,dfp); fwrite(&dFc,4,1,dfp); fwrite(&Mv,4,1,dfp); fwrite(&res,4,1,dfp);
-                fwrite(mesh.verts.data(),4,(size_t)dV*3,dfp);
-                fwrite(mesh.faces.data(),4,(size_t)dFc*3,dfp);
-                for (auto& c : *pbr_coords) { int xyz[3] = {c[0],c[1],c[2]}; fwrite(xyz,4,3,dfp); }
-                fwrite(pbr6.data(),4,(size_t)Mv*6,dfp);
+                bool ok = fwrite(&dV,4,1,dfp)==1 && fwrite(&dFc,4,1,dfp)==1
+                       && fwrite(&Mv,4,1,dfp)==1 && fwrite(&res,4,1,dfp)==1;
+                ok = ok && fwrite(mesh.verts.data(),4,(size_t)dV*3,dfp) == (size_t)dV*3;
+                ok = ok && fwrite(mesh.faces.data(),4,(size_t)dFc*3,dfp) == (size_t)dFc*3;
+                for (auto& c : *pbr_coords) { int xyz[3] = {c[0],c[1],c[2]}; if (ok) ok = fwrite(xyz,4,3,dfp)==3; }
+                ok = ok && fwrite(pbr6.data(),4,(size_t)Mv*6,dfp) == (size_t)Mv*6;
                 fclose(dfp);
-                printf("      [dump] post-stage inputs -> %s\n", dp);
-            }
+                if (!ok) {
+                    fprintf(stderr, "      [master] short write to %s\n", part.c_str());
+                    trellis::discard_part(master);
+                } else if (trellis::commit_part(master)) {
+                    const double mb = ((double)dV*3*4 + (double)dFc*3*4
+                                     + (double)Mv*3*4 + (double)Mv*6*4) / (1024.0*1024.0);
+                    printf("      [master] %s (V=%d F=%d, PBR=%d @res%d, %.0f MB)\n",
+                           master.c_str(), dV, dFc, Mv, res, mb);
+                }
+            } else fprintf(stderr, "      [master] cannot write %s\n", part.c_str());
         }
         trellis::weld_vertices(mesh.verts, mesh.faces, colors.empty() ? nullptr : &colors,
                                1.0f / ((float)so.res * 8.0f));
